@@ -1,0 +1,12 @@
+"""Starting self-edit policy. Candidates may improve this module itself."""
+
+import json
+
+
+def build_prompt(evidence, goal):
+    return (
+        "Improve this Python system using the failure evidence. "
+        "Fix general causes, never hardcode task answers. "
+        "Edit the allowed source files directly.\n"
+        + goal + "\nEvidence:\n" + json.dumps(evidence, ensure_ascii=False)
+    )

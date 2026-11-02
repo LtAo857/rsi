@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsi-local"
+version = "0.1.0"
+description = "Versioned self-improvement of an agent and its improvement policy"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+rsi = "kernel.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kernel*", "agent*", "evolution*"]

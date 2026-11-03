@@ -19,6 +19,9 @@ import tempfile
 import time
 import uuid
 
+from .backends import ModelUnavailable
+from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace, patch_stats,
+                     review_proposal, candidate_workspace)
 from .evaluation import REPAIR_SOURCE, REPAIR_TESTS, repair_goal, tasks
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -47,7 +50,7 @@ def identity(root):
 
 
 class Engine:
-    def __init__(self, state_dir, command=None, timeout=300):
+    def __init__(self, state_dir, command=None, timeout=300, task_command=None, **settings):
         self.root = Path(state_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.versions = self.root / "versions"
@@ -55,6 +58,16 @@ class Engine:
         self.state_path = self.root / "state.json"
         self.command = command
         self.timeout = timeout
+        self.search = SearchSettings(**settings)
+        runtime_path = self.root / 'runtime.json'
+        saved = json.loads(runtime_path.read_text()) if runtime_path.exists() else None
+        if saved is not None and task_command is not None and saved['task_command'] != task_command:
+            raise ValueError('task model configuration changed; use a new state directory')
+        if saved is None and task_command is not None and self.state_path.exists():
+            raise ValueError('cannot add a task model to an existing experiment; use a new state directory')
+        self.task_command = saved['task_command'] if saved is not None else task_command
+        # Persist at initialization under the writer lock, not in a read-only constructor.
+
 
     @contextmanager
     def lock(self):
@@ -84,6 +97,35 @@ class Engine:
         return self.versions / version_id
 
     def call(self, root, op, **arguments):
+        use_model = arguments.pop('use_model', True)
+        if op == 'solve' and self.task_command and use_model:
+            messages = self.call(root, 'messages', task=arguments['task'])
+            if (not isinstance(messages, dict) or set(messages) != {'system', 'prompt'} or
+                    any(not isinstance(value, str) for value in messages.values())):
+                raise ValueError('build_messages(task) must return system and prompt strings')
+            if len(json.dumps(messages)) > 100_000:
+                raise ValueError('task model prompt exceeds 100KB')
+            logs = self.root / 'model-calls'
+            logs.mkdir(exist_ok=True)
+            fingerprint = identity(root)
+            try:
+                output = self.code(root, json.dumps(messages, ensure_ascii=False),
+                                   logs / (uuid.uuid4().hex + '.log'), command=self.task_command)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+                raise ModelUnavailable('model unavailable: ' + str(error)) from error
+            if identity(root) != fingerprint:
+                raise RuntimeError('task model adapter modified generation source')
+            responses = []
+            for line in output.splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get('model_response'), str):
+                    responses.append(row['model_response'])
+            if len(responses) != 1:
+                raise ModelUnavailable('model unavailable: adapter returned no unique response')
+            arguments['model_response'] = responses[0]
         before = identity(root)
         process = subprocess.run(
             [sys.executable, "-I", "-B", str(WORKER)],
@@ -100,8 +142,10 @@ class Engine:
             if not (root / relative).is_file():
                 raise ValueError("missing " + relative)
         self.call(root, "plan", evidence={}, goal="health check")
-        value = self.call(root, "solve", task={"operation": "sum",
+        value = self.call(root, "solve", use_model=False, task={"operation": "sum",
                                               "observation": '{"values": [2, 3]}'})
+        if self.task_command:
+            self.call(root, 'messages', task={'operation':'sum', 'observation':'{"values":[2,3]}'})
         if value != 5:
             raise ValueError("basic solver health check failed")
 
@@ -116,6 +160,12 @@ class Engine:
         return version_id
 
     def initialize(self):
+        if self.task_command:
+            runtime = self.root / 'runtime.json'
+            if runtime.exists() and json.loads(runtime.read_text())['task_command'] != self.task_command:
+                raise ValueError('task model configuration changed; use a new state directory')
+            if not runtime.exists():
+                atomic_json(runtime, {'task_command':self.task_command})
         if self.state_path.exists():
             return self.state()
         with tempfile.TemporaryDirectory(prefix="rsi-seed-") as directory:
@@ -161,14 +211,89 @@ class Engine:
         if not all(relative in files for relative in REQUIRED):
             raise ValueError("required interfaces were removed")
 
-    def code(self, workspace, prompt, log):
-        if not self.command:
+    def code(self, workspace, prompt, log, command=None):
+        command = command or self.command
+        if not command:
             raise RuntimeError("a coding command is required; use --coder or --demo")
-        process = subprocess.run(self.command, input=prompt, cwd=workspace,
-                                 text=True, capture_output=True, timeout=self.timeout)
+        usage_path = self.root / "usage.json"
+        usage = (json.loads(usage_path.read_text()) if usage_path.exists() else
+                 {"calls": 0, "tokens": 0, "cost_usd": 0.0,
+                  "unknown_tokens": 0, "unknown_cost": 0})
+        for limit, key in ((self.search.max_calls, "calls"),
+                           (self.search.max_tokens, "tokens"),
+                           (self.search.max_cost, "cost_usd")):
+            if limit is not None and usage[key] >= limit:
+                raise RuntimeError("budget exhausted: " + key)
+        if ((self.search.max_tokens is not None and usage["unknown_tokens"]) or
+                (self.search.max_cost is not None and usage["unknown_cost"])):
+            raise RuntimeError("usage unknown; cannot enforce configured budget")
+        # Reserve before launching: a crash or timeout cannot erase a paid invocation.
+        usage["calls"] += 1
+        usage["unknown_tokens"] += 1
+        usage["unknown_cost"] += 1
+        atomic_json(usage_path, usage)
+        try:
+            process = subprocess.run(command, input=prompt, cwd=workspace,
+                                     text=True, capture_output=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired as error:
+            def decoded(value):
+                return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
+            log.write_text(decoded(error.stdout) + "\n" + decoded(error.stderr))
+            atomic_json(log.with_suffix(".trace.json"), {"failures": ["timeout"],
+                                                       "tokens": None, "cost_usd": None})
+            raise
         log.write_text(process.stdout + "\n" + process.stderr)
+        trace = inspect_trace(process.stdout)
+        if process.returncode:
+            trace["failures"].append("command_error")
+        atomic_json(log.with_suffix(".trace.json"), trace)
+        for key, missing in (("tokens", "unknown_tokens"), ("cost_usd", "unknown_cost")):
+            if trace[key] is not None:
+                usage[key] += trace[key]
+                usage[missing] -= 1
+        atomic_json(usage_path, usage)
         if process.returncode:
             raise RuntimeError(f"coding command failed ({process.returncode}); see {log}")
+        for limit, key in ((self.search.max_tokens, "tokens"), (self.search.max_cost, "cost_usd")):
+            if limit is not None and trace[key] is None:
+                raise RuntimeError("usage missing for configured budget: " + key)
+            if limit is not None and usage[key] > limit:
+                raise RuntimeError("budget exceeded: " + key)
+        if set(trace["failures"]) & {"give_up", "loop", "repeated_tool_call", "tool_error"}:
+            raise TraceFailure("trace failure: " + ", ".join(trace["failures"]))
+        return process.stdout
+
+    def search_evidence(self):
+        history = self.recent_history(limit=None)
+        counts = {"agent": 0, "evolution": 0}
+        streak = 0
+        for row in history:
+            audit = Path(row["audit"]) if row.get("audit") else None
+            if audit:
+                patch = audit / "changes.patch"
+                if patch.exists():
+                    row["patch"] = patch.read_text()
+                traces = [json.loads(path.read_text()) for path in sorted(audit.glob("*.trace.json"))]
+                if traces:
+                    row["diagnostics"] = traces
+            if row.get("type") == "round":
+                streak = 0 if row.get("accepted") else streak + 1
+                for component in counts:
+                    counts[component] += any(p.startswith(component + "/") for p in row.get("changed", []))
+        target = min(counts, key=counts.get) if streak >= self.search.stagnation else None
+        number = self.state()["round"]
+        return {"history": history, "search": {
+            "edit_budget": self.search.budget(number), "stagnation": streak,
+            "attempts": counts, "target": target,
+            "prune": (number + 1) % self.search.prune_every == 0}}
+
+    def trials(self, root, audit, label, seed, first=None):
+        rows = []
+        for i in range(self.search.trials):
+            evaluation = first if i == 0 and first is not None else self.score(root, seed + i)
+            atomic_json(audit / f'{label}-{i}.tasks.json', evaluation)
+            rows.append([evaluation['score'], self.meta_probe(root, audit, f'{label}-{i}')])
+        return rows
 
     def score(self, root, seed):
         rows = []
@@ -178,6 +303,8 @@ class Engine:
                 success = (isinstance(answer, (int, float)) and not isinstance(answer, bool)
                            and math.isfinite(answer) and abs(answer - expected) < 1e-8)
                 rows.append({"task": task, "ok": success, "answer": answer})
+            except ModelUnavailable:
+                raise
             except Exception as error:
                 rows.append({"task": task, "ok": False, "error": str(error)[-1000:]})
         return {"score": sum(row["ok"] for row in rows) / len(rows), "traces": rows}
@@ -192,7 +319,10 @@ class Engine:
             (workspace / "solution.py").write_text(REPAIR_SOURCE)
             (workspace / "test_solution.py").write_text(REPAIR_TESTS)
             original_tests = (workspace / "test_solution.py").read_bytes()
-            self.code(workspace, prompt, audit / (label + ".log"))
+            try:
+                self.code(workspace, prompt, audit / (label + ".log"))
+            except TraceFailure:
+                return 0.0
             if (workspace / "test_solution.py").read_bytes() != original_tests:
                 return 0.0
             files = manifest(workspace)
@@ -229,25 +359,65 @@ class Engine:
         audit = self.root / "rounds" / f"{number:04d}-{uuid.uuid4().hex[:8]}"
         audit.mkdir(parents=True)
         old = self.score(current, seed=number + 10)
-        old_meta = self.meta_probe(current, audit, "base-meta")
+        old_trials = self.trials(current, audit, "base-meta", number + 10, first=old)
+        old_meta = sum(row[1] for row in old_trials) / len(old_trials)
         evidence = {"task_evaluation": old, "improvement_score": old_meta,
-                    "history": self.recent_history()}
+                    **self.search_evidence()}
+        failures = []
+        for index, row in enumerate(old["traces"]):
+            if not row["ok"]:
+                failures.append({"id": f"task-{index}", "kind": "task_failure", "trace": row})
+        if old_meta < 1:
+            failures.append({"id": "policy-repair", "kind": "repair_failure", "score": old_meta})
+        for trace_path in sorted(audit.glob("base-meta-*.trace.json")):
+            trace = json.loads(trace_path.read_text())
+            if trace["failures"]:
+                failures.append({"id": "trace-" + trace_path.stem,
+                                 "kind": "trace_failure", "trace": trace})
+        failures.append({"id": "complexity", "kind": "maintenance",
+                         "description": "Remove redundant mechanisms without losing capability"})
+        evidence["failures"] = failures
         goal = ("Improve this system's task solver AND its self-improvement policy. "
                 "Only agent/ and evolution/ may change. Preserve solve(task) and "
                 "build_prompt(evidence, goal). Do not access the supervisor, its state, "
                 "benchmarks or answers. The next generation will use YOUR updated "
                 "evolution/policy.py to produce further improvements.")
+        if self.task_command:
+            goal += " Preserve build_messages(task) returning system/prompt strings and solve(task, llm=None). The task runtime supports one stateless model call per task."
         prompt = self.call(current, "plan", evidence=evidence, goal=goal)
+        prompt += ("\nSupervisor requirements: Read Evidence before editing. Write .rsi-proposal.json "
+                   "with analysis (evidence and cause), and changes: a list of objects containing "
+                   "files, failure_id, cause, expected_effect, validation. Each changed file must "
+                   "reference a supplied failure ID. Obey Evidence.search edit_budget (added plus "
+                   "removed lines), target component, and prune (net deletion if true). "
+                   "Do not alter kernel, tests or Git metadata.\nEvidence:\n"
+                   + json.dumps(evidence, ensure_ascii=False))
+        if len(prompt) > 100_000:
+            raise RuntimeError("complete history exceeds prompt budget; use a new experiment state")
         (audit / "proposal.txt").write_text(prompt)
         atomic_json(audit / "evidence.json", evidence)
         record = {"type": "round", "round": number, "parent": state["active"],
                   "planner_version": state["active"], "accepted": False,
-                  "baseline": [old["score"], old_meta], "audit": str(audit)}
-        with tempfile.TemporaryDirectory(prefix="rsi-candidate-") as directory:
-            candidate = Path(directory) / "source"
-            shutil.copytree(current, candidate, ignore=shutil.ignore_patterns("__pycache__"))
+                  "baseline": [sum(r[0] for r in old_trials) / len(old_trials), old_meta],
+                  "audit": str(audit), "search": evidence["search"],
+                  "workspace": "git-worktree" if self.search.worktrees else "copy",
+                  "trials": {"baseline": old_trials}}
+        with candidate_workspace(current, self.search.worktrees) as candidate:
             try:
+                git_control = (candidate / ".git").read_bytes() if self.search.worktrees else None
                 self.code(candidate, prompt, audit / "coder.log")
+                if self.search.worktrees:
+                    if (candidate / ".git").read_bytes() != git_control:
+                        raise ValueError("candidate changed Git metadata")
+                    (candidate / ".git").unlink()
+                proposal_path = candidate / ".rsi-proposal.json"
+                if not proposal_path.is_file() or proposal_path.is_symlink():
+                    raise ValueError("proposal manifest .rsi-proposal.json is required")
+                if proposal_path.stat().st_size > 100_000:
+                    raise ValueError("proposal too large")
+                proposal = json.loads(proposal_path.read_text())
+                proposal_path.unlink()
+                atomic_json(audit / "proposal.json", proposal)
                 self.validate_tree(candidate)
                 shutil.copytree(candidate, audit / "candidate",
                                 ignore=shutil.ignore_patterns("__pycache__"))
@@ -259,6 +429,37 @@ class Engine:
                     patch.extend(difflib.unified_diff(before_text, after_text,
                                  fromfile="before/" + relative, tofile="after/" + relative))
                 (audit / "changes.patch").write_text("".join(patch))
+                stats = patch_stats(current, candidate)
+                record["changed"] = stats["files"]
+                review = review_proposal(proposal, stats, evidence)
+                if self.search.reviewer:
+                    # The reviewer receives a disposable copy; any source mutation is rejected.
+                    with tempfile.TemporaryDirectory(prefix="rsi-review-") as directory:
+                        review_root = Path(directory) / "source"
+                        shutil.copytree(candidate, review_root)
+                        fingerprint = identity(review_root)
+                        review_prompt = json.dumps({"instruction": "Review evidence and patch. Return one JSON line with approved (boolean) and reason. Do not modify files.",
+                                                    "evidence": evidence, "proposal": proposal,
+                                                    "patch": "".join(patch)})
+                        output = self.code(review_root, review_prompt, audit / "reviewer.log",
+                                           command=self.search.reviewer)
+                        if identity(review_root) != fingerprint:
+                            raise ValueError("reviewer modified source")
+                        verdicts = []
+                        for line in output.splitlines():
+                            try:
+                                value = json.loads(line)
+                            except ValueError:
+                                continue
+                            if isinstance(value, dict) and "approved" in value:
+                                verdicts.append(value)
+                        if len(verdicts) != 1 or type(verdicts[0]["approved"]) is not bool:
+                            raise ValueError("reviewer must return one boolean verdict")
+                        review["independent"] = verdicts[0]
+                        review["approved"] = verdicts[0]["approved"]
+                atomic_json(audit / "review.json", review)
+                if not review["approved"]:
+                    raise ValueError("reviewer rejected: " + str(review["independent"].get("reason", "")))
                 self.health(candidate)
                 candidate_id = identity(candidate)
                 if candidate_id == state["active"]:
@@ -268,18 +469,16 @@ class Engine:
                 record["changed"] = [p for p in sorted(set(before) | set(after))
                                      if before.get(p) != after.get(p)]
                 new = self.score(candidate, seed=number + 10)
-                new_meta = self.meta_probe(candidate, audit, "candidate-meta")
-                record["candidate"] = [new["score"], new_meta]
+                new_trials = self.trials(candidate, audit, "candidate-meta", number + 10, first=new)
+                record["candidate"] = [sum(r[d] for r in new_trials) / len(new_trials) for d in range(2)]
+                record["trials"]["candidate"] = new_trials
                 atomic_json(audit / "evaluation.json", new)
-                if self.better(record["candidate"], record["baseline"]):
-                    # Confirmation uses fresh task inputs; no held-out selection.
-                    base_confirm = self.score(current, seed=number + 10010)
-                    confirm = self.score(candidate, seed=number + 10010)
-                    confirm_meta = self.meta_probe(candidate, audit, "confirm-meta")
-                    baseline_meta = self.meta_probe(current, audit, "base-confirm-meta")
-                    record["confirmation"] = [confirm["score"], confirm_meta]
-                    if self.better(record["confirmation"],
-                                   [base_confirm["score"], baseline_meta]):
+                if confirmed_gain(new_trials, old_trials, self.search.noise_floor, evidence["search"]["prune"]):
+                    base_confirm = self.trials(current, audit, "base-confirm-meta", number + 10010)
+                    confirm = self.trials(candidate, audit, "confirm-meta", number + 10010)
+                    record["trials"].update(confirmation=confirm, baseline_confirmation=base_confirm)
+                    record["confirmation"] = [sum(r[d] for r in confirm) / len(confirm) for d in range(2)]
+                    if confirmed_gain(confirm, base_confirm, self.search.noise_floor, evidence["search"]["prune"]):
                         version_id = self.publish(candidate)
                         # Activation readiness is checked from the published generation.
                         self.health(self.version(version_id))
@@ -311,11 +510,12 @@ class Engine:
                   "离线 demo 使用预设补丁，分数仅验证生命周期，不证明模型自主改进能力。"]
         (self.root / "REPORT.md").write_text("\n".join(lines) + "\n")
 
-    def recent_history(self):
+    def recent_history(self, limit=8):
         path = self.root / "history.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines()[-8:]]
+        lines = path.read_text().splitlines()
+        return [json.loads(line) for line in (lines[-limit:] if limit is not None else lines)]
 
     def run(self, rounds):
         with self.lock():

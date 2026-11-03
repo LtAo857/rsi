@@ -24,7 +24,20 @@ def main():
     sys.path.insert(0, str(root))
     with contextlib.redirect_stdout(io.StringIO()):
         if request["op"] == "solve":
-            result = load(root, "agent/solver.py").solve(request["task"])
+            module = load(root, "agent/solver.py")
+            if 'model_response' in request:
+                called = [False]
+                def llm(system, prompt):
+                    if called[0]:
+                        raise ValueError('only one stateless model call is supported per task')
+                    called[0] = True
+                    # The fixed runner supports exactly one stateless call per task.
+                    return request['model_response']
+                result = module.solve(request['task'], llm=llm)
+            else:
+                result = module.solve(request["task"])
+        elif request['op'] == 'messages':
+            result = load(root, 'agent/solver.py').build_messages(request['task'])
         else:
             result = load(root, "evolution/policy.py").build_prompt(
                 request["evidence"], request["goal"])

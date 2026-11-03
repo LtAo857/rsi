@@ -4,12 +4,12 @@ Two predetermined edits make it possible to exercise activation and handoff
 without credentials, network calls or spending model quota.
 """
 
+import json
 from pathlib import Path
 import sys
 
 
-def main():
-    prompt = sys.stdin.read()
+def edit(prompt):
     root = Path.cwd()
     solution = root / "solution.py"
     if solution.exists():
@@ -36,6 +36,27 @@ def main():
                 '"Read the tests before editing. Run them after the patch. "\n'
                 '        "Improve this Python system using the failure evidence. "')
             policy.write_text(source)
+
+
+def main():
+    prompt = sys.stdin.read()
+    paths = [Path('agent/solver.py'), Path('evolution/policy.py')]
+    before = {str(p): p.read_text() for p in paths if p.exists()}
+    edit(prompt)
+    if before:
+        evidence = json.loads(prompt.rsplit('Evidence:\n', 1)[1])
+        changes = []
+        for name, source in before.items():
+            if Path(name).read_text() != source:
+                failure_id = ('task-1' if name.startswith('agent/') else 'policy-repair')
+                changes.append({'files': [name], 'failure_id': failure_id,
+                                'cause': 'Scripted fixture for the supplied failure',
+                                'expected_effect': 'Exercise lifecycle improvement',
+                                'validation': 'Run supervisor evaluations'})
+        Path('.rsi-proposal.json').write_text(json.dumps({
+            'analysis': 'Scripted fixture: inspect supplied failures before applying predetermined edits.',
+            'changes': changes}))
+    print(json.dumps({'type': 'usage', 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0}))
 
 
 if __name__ == "__main__":

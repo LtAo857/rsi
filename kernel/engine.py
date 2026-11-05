@@ -24,6 +24,8 @@ from .execution import CallLimit, run_bounded
 from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace, patch_stats,
                      review_proposal, candidate_workspace)
 from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
+from .datadesk import Toolbox, check_answer, run_session
+from .datadesk_tasks import EVOLVE, HELDOUT_ONLY, make_split
 
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("worker.py")
@@ -51,7 +53,7 @@ def identity(root):
 
 
 class Engine:
-    def __init__(self, state_dir, command=None, timeout=300, task_command=None, benchmark=None, **settings):
+    def __init__(self, state_dir, command=None, timeout=300, task_command=None, benchmark=None, datadesk_size=None, **settings):
         self.root = Path(state_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.versions = self.root / "versions"
@@ -64,8 +66,14 @@ class Engine:
         saved = json.loads(runtime_path.read_text()) if runtime_path.exists() else None
         saved_benchmark = saved.get('benchmark', 'basic') if saved else 'basic'
         self.benchmark = benchmark or saved_benchmark
-        if self.benchmark not in ('basic', 'advanced'):
+        if self.benchmark not in ('basic', 'advanced', 'datadesk'):
             raise ValueError('unknown benchmark suite')
+        saved_size = saved.get('datadesk_size', 'compact') if saved else 'compact'
+        self.datadesk_size = datadesk_size or saved_size
+        if self.datadesk_size not in ('compact', 'full'):
+            raise ValueError('unknown DataDesk size')
+        if (saved or self.state_path.exists()) and self.datadesk_size != saved_size:
+            raise ValueError('DataDesk size changed; use a new state directory')
         if (saved or self.state_path.exists()) and self.benchmark != saved_benchmark:
             raise ValueError('benchmark changed; use a new state directory')
         if saved is not None and task_command is not None and saved['task_command'] != task_command:
@@ -73,6 +81,8 @@ class Engine:
         if saved is None and task_command is not None and self.state_path.exists():
             raise ValueError('cannot add a task model to an existing experiment; use a new state directory')
         self.task_command = saved['task_command'] if saved is not None else task_command
+        if self.benchmark == 'datadesk' and not self.task_command:
+            raise ValueError('DataDesk requires a task model backend; choose --task-backend')
         # Persist at initialization under the writer lock, not in a read-only constructor.
 
 
@@ -105,34 +115,12 @@ class Engine:
 
     def call(self, root, op, **arguments):
         use_model = arguments.pop('use_model', True)
+        if op == 'solve' and arguments['task'].get('kind') == 'datadesk':
+            task = arguments['task']
+            return self.datadesk_session(root, task['question'], task['data_dir'])
         if op == 'solve' and self.task_command and use_model:
             messages = self.call(root, 'messages', task=arguments['task'])
-            if (not isinstance(messages, dict) or set(messages) != {'system', 'prompt'} or
-                    any(not isinstance(value, str) for value in messages.values())):
-                raise ValueError('build_messages(task) must return system and prompt strings')
-            if len(json.dumps(messages)) > 100_000:
-                raise ValueError('task model prompt exceeds 100KB')
-            logs = self.root / 'model-calls'
-            logs.mkdir(exist_ok=True)
-            fingerprint = identity(root)
-            try:
-                output = self.code(root, json.dumps(messages, ensure_ascii=False),
-                                   logs / (uuid.uuid4().hex + '.log'), command=self.task_command)
-            except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
-                raise ModelUnavailable('model unavailable: ' + str(error)) from error
-            if identity(root) != fingerprint:
-                raise RuntimeError('task model adapter modified generation source')
-            responses = []
-            for line in output.splitlines():
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict) and isinstance(row.get('model_response'), str):
-                    responses.append(row['model_response'])
-            if len(responses) != 1:
-                raise ModelUnavailable('model unavailable: adapter returned no unique response')
-            arguments['model_response'] = responses[0]
+            arguments['model_response'] = self.model_response(root, messages)
         before = identity(root)
         process = subprocess.run(
             [sys.executable, "-I", "-B", str(WORKER)],
@@ -144,12 +132,61 @@ class Engine:
             raise RuntimeError(process.stderr[-2000:])
         return json.loads(process.stdout)["result"]
 
+    def model_response(self, root, messages):
+        if not self.task_command:
+            raise ModelUnavailable('DataDesk requires a task model backend')
+        if (not isinstance(messages, dict) or set(messages) != {'system', 'prompt'} or
+                any(not isinstance(value, str) for value in messages.values())):
+            raise ValueError('build_messages(task) must return system and prompt strings')
+        if len(json.dumps(messages)) > 100_000:
+            raise ValueError('task model prompt exceeds 100KB')
+        logs = self.root / 'model-calls'
+        logs.mkdir(exist_ok=True)
+        fingerprint = identity(root)
+        try:
+            output = self.code(root, json.dumps(messages, ensure_ascii=False),
+                               logs / (uuid.uuid4().hex + '.log'), command=self.task_command)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+            raise ModelUnavailable('model unavailable: ' + str(error)) from error
+        if identity(root) != fingerprint:
+            raise RuntimeError('task model adapter modified generation source')
+        responses = []
+        for line in output.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get('model_response'), str):
+                responses.append(row['model_response'])
+        if len(responses) != 1:
+            raise ModelUnavailable('model unavailable: adapter returned no unique response')
+        return responses[0]
+
+    def datadesk_session(self, root, question, data_dir):
+        if not isinstance(question, str) or not question.strip() or len(question) > 10000:
+            raise ValueError('invalid DataDesk question')
+        tools = Toolbox(data_dir)
+        def choose(context):
+            messages = self.call(root, 'messages', task=context)
+            text = self.model_response(root, messages)
+            return self.call(root, 'action', text=text)
+        try:
+            return run_session(question, tools, choose)
+        finally:
+            tools.close()
+
     def health(self, root):
         for relative in REQUIRED:
             if not (root / relative).is_file():
                 raise ValueError("missing " + relative)
         self.call(root, "plan", evidence={}, goal="health check")
         self.analyze(root, {'failures': [{'id': 'health', 'kind': 'maintenance'}]})
+        if self.benchmark == 'datadesk':
+            messages = self.call(root, 'messages', task={'kind':'datadesk', 'question':'health', 'history':[]})
+            if not isinstance(messages, dict) or set(messages) != {'system', 'prompt'} or any(not isinstance(v, str) for v in messages.values()):
+                raise ValueError('invalid DataDesk messages')
+            if self.call(root, 'action', text='{"answer":"health"}') != {'answer':'health'}:
+                raise ValueError('DataDesk parse_action health check failed')
         value = self.call(root, "solve", use_model=False, task={"operation": "sum",
                                               "observation": '{"values": [2, 3]}'})
         if self.task_command:
@@ -188,7 +225,8 @@ class Engine:
             if runtime.exists() and json.loads(runtime.read_text())['task_command'] != self.task_command:
                 raise ValueError('task model configuration changed; use a new state directory')
             if not runtime.exists():
-                atomic_json(runtime, {'task_command':self.task_command, 'benchmark':self.benchmark})
+                atomic_json(runtime, {'task_command':self.task_command, 'benchmark':self.benchmark,
+                                      'datadesk_size':self.datadesk_size})
         if self.state_path.exists():
             return self.state()
         with tempfile.TemporaryDirectory(prefix="rsi-seed-") as directory:
@@ -394,11 +432,12 @@ class Engine:
             if self.search.cache_baseline and label == 'base-meta':
                 # Initial baseline only: confirmation and candidate trials stay fresh.
                 # Hash the environment, never write its credential values to disk.
-                context = [identity(root), self.benchmark, seed + i, self.command,
+                context = [identity(root), self.benchmark, self.datadesk_size, seed + i, self.command,
                            self.task_command, self.timeout, sys.version,
                            sorted(os.environ.items()),
                            [(name, hashlib.sha256((SOURCE / 'kernel' / name).read_bytes()).hexdigest())
-                            for name in ('engine.py', 'evaluation.py', 'worker.py', 'backends.py', 'search.py')]]
+                            for name in ('engine.py', 'evaluation.py', 'worker.py', 'backends.py', 'search.py',
+                                         'datadesk.py', 'datadesk_tasks.py')]]
                 key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
                 cache = self.root / 'baseline-cache' / (key + '.json')
                 if cache.exists():
@@ -443,7 +482,9 @@ class Engine:
                               candidate_costs=costs(new_label), baseline_costs=costs(old_label),
                               cost_band=self.search.cost_band)
 
-    def score(self, root, seed):
+    def score(self, root, seed, heldout=False):
+        if self.benchmark == 'datadesk':
+            return self.score_datadesk(root, seed, heldout)
         rows = []
         for task, expected in tasks(seed, suite=self.benchmark):
             try:
@@ -457,10 +498,41 @@ class Engine:
                 rows.append({"task": task, "ok": False, "error": str(error)[-1000:]})
         return {"score": sum(row["ok"] for row in rows) / len(rows), "traces": rows}
 
+    def score_datadesk(self, root, seed, heldout=False):
+        if not self.task_command:
+            raise ModelUnavailable('DataDesk requires a task model backend')
+        with tempfile.TemporaryDirectory(prefix='rsi-datadesk-') as directory:
+            directory = Path(directory)
+            (directory / 'tasks').mkdir()
+            hashes = {}
+            families = EVOLVE + HELDOUT_ONLY if heldout else EVOLVE
+            plan = [(f,1) for f in families]
+            if self.datadesk_size == 'full':
+                plan = ([(f,2) for f in EVOLVE] + [(f,5) for f in HELDOUT_ONLY] if heldout
+                        else [(f,3) for f in EVOLVE])
+            ids = make_split(directory, 'evaluation', 'd', plan, seed, hashes)
+            metadata = json.loads((directory / 'tasks/evaluation.json').read_text())
+            rows = []
+            for tid in ids:
+                item = metadata[tid]
+                task = {'kind':'datadesk', 'id':tid, 'question':item['question'], 'type':item['type']}
+                try:
+                    session = self.datadesk_session(root, item['question'], directory / 'tasks/evaluation' / tid)
+                    ok = session['stop_reason'] == 'answer' and check_answer(tid, item['type'], session['answer'], hashes[tid])
+                    rows.append({'task':task, 'ok':ok, **session})
+                except ModelUnavailable:
+                    raise
+                except Exception as error:
+                    rows.append({'task':task, 'ok':False, 'error':str(error)[-1000:]})
+            return {'score':sum(row['ok'] for row in rows) / len(rows), 'traces':rows,
+                    'split':'heldout' if heldout else 'search', 'seed':seed, 'families':families,
+                    'size':self.datadesk_size}
+
     def meta_probe(self, root, audit, label, case_index=0):
         # Exercise the generation's own policy on a separate code-repair task.
         # Scoring is done here, not by the candidate or the coding model.
-        return self.repair_probe(root, audit, label, repair_case(self.benchmark, case_index))
+        suite = 'advanced' if self.benchmark == 'datadesk' else self.benchmark
+        return self.repair_probe(root, audit, label, repair_case(suite, case_index))
 
     def repair_probe(self, root, audit, label, case):
         """Score a supervisor-owned project without exposing hidden test values."""
@@ -539,7 +611,11 @@ class Engine:
                 "benchmarks or answers. The next generation will use YOUR updated "
                 "evolution/policy.py to produce further improvements.")
         if self.task_command:
-            goal += " Preserve build_messages(task) returning system/prompt strings and solve(task, llm=None). The task runtime supports one stateless model call per task."
+            goal += " Preserve build_messages(task) returning system/prompt strings and solve(task, llm=None)."
+            if self.benchmark == 'datadesk':
+                goal += " Preserve parse_action(text). DataDesk runs up to 10 actions: JSON {tool,args} or {answer}. build_messages receives question, tool descriptions and full action/result history. Tools and scoring are fixed."
+            else:
+                goal += " The task runtime supports one stateless model call per task."
         prompt = self.call(current, "plan", evidence=evidence, goal=goal)
         evidence_block = '\nEvidence:\n' + json.dumps(evidence, ensure_ascii=False)
         if prompt.endswith(evidence_block):

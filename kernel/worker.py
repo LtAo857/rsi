@@ -38,6 +38,8 @@ def main():
                 result = module.solve(request["task"])
         elif request['op'] == 'messages':
             result = load(root, 'agent/solver.py').build_messages(request['task'])
+        elif request['op'] == 'action':
+            result = load(root, 'agent/solver.py').parse_action(request['text'])
         elif request['op'] == 'analyze':
             policy = load(root, 'evolution/policy.py')
             result = policy.analyze(request['evidence']) if hasattr(policy, 'analyze') else None

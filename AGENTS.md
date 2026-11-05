@@ -10,7 +10,7 @@ Use `python -m unittest discover -s tests -v` to verify the offline lifecycle.
 Offline demo patches are scripted fixtures: never describe their scores as evidence
 of autonomous discovery. Keep runtime limitations explicit in README.
 
-机制开发进度以 README.md 的「上游机制落地清单」为准。每完成并验证一项机制，
+机制开发进度以 README.md 的「功能与验证状态」为准。每完成并验证一项机制，
 同步更新勾选、实现说明与验证记录；部分实现保持未勾选并说明缺口。
 不得把可选接入写成默认启用，也不得将基础规则检查描述为语义验证或安全沙箱。
 

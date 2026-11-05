@@ -24,8 +24,9 @@ def main():
     run.add_argument("--coder-model", default="", help="编码模型名，Codex 留空使用本机配置")
     mode.add_argument("--demo", action="store_true", help="确定性离线演示，不调用模型")
     run.add_argument('--trials', type=int, default=2, help='每阶段配对评测次数')
-    run.add_argument('--benchmark', choices=['basic', 'advanced'],
-                     help='评测套件；advanced 增加条件聚合、分组与多类代码修复，选择后锁定')
+    run.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'],
+                     help='评测套件；datadesk 使用 CSV/SQL 多轮任务模型，选择后锁定')
+    run.add_argument('--datadesk-size', choices=['compact', 'full'], help='compact 每类一题；full 原始 15 道搜索/20 道留出题，选择后锁定')
     run.add_argument('--noise-floor', type=float, default=.01, help='最小有效分数提升')
     run.add_argument('--regression-tolerance', type=float, default=0.0, help='可选配对置信下界容忍，默认逐 trial 不退步')
     run.add_argument('--cost-band', type=float, default=.05, help='接受等能力降本版本所需的最小 token 节省比例')
@@ -53,12 +54,23 @@ def main():
     solve.add_argument('--max-calls', type=int)
     solve.add_argument('--max-tokens', type=int)
     solve.add_argument('--max-cost', type=float)
-    for command_parser in (run, solve):
+    evaluate = sub.add_parser('evaluate', help='运行当前版本的任务评测，不参与搜索')
+    evaluate.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'])
+    evaluate.add_argument('--datadesk-size', choices=['compact', 'full'])
+    evaluate.add_argument('--split', choices=['search', 'heldout'], default='search')
+    evaluate.add_argument('--seed', type=int, default=982451653)
+    evaluate.add_argument('--timeout', type=int, default=120)
+    for name in ('max-calls', 'max-tokens', 'max-call-tokens', 'max-prompt-chars', 'max-output-bytes'):
+        evaluate.add_argument('--' + name, type=int)
+    evaluate.add_argument('--max-cost', type=float)
+    for command_parser in (run, solve, evaluate):
         command_parser.add_argument('--codex-isolated', action='store_true', help='Codex 忽略用户配置（保留登录），排除外部 MCP 启动干扰')
         command_parser.add_argument('--task-backend', choices=['deepseek', 'codex'], help='任务模型后端，省略使用状态配置或离线求解器')
         command_parser.add_argument('--task-model', default='', help='任务模型名')
         command_parser.add_argument('--base-url', help='DeepSeek/OpenAI 兼容接口基础 URL')
         command_parser.add_argument('--api-key-env', help='存放 API 密钥的环境变量名')
+        command_parser.add_argument('--task-output-tokens', type=int, help='DeepSeek 每个任务动作的服务端输出 token 上限')
+        command_parser.add_argument('--task-thinking', choices=['enabled', 'disabled'], help='DeepSeek 任务模型思考模式')
     sub.add_parser("status", help="查看版本与改进历史")
     sub.add_parser("heldout", help="最终留出集验证，不参与版本选择")
     validate = sub.add_parser('validate', help='在多个新种子上比较初始与当前版本，不参与搜索')
@@ -80,6 +92,8 @@ def main():
     sub.add_parser("stop", help="当前轮完成后停止")
     sub.add_parser("resume", help="清除停止标记")
     args = parser.parse_args()
+    if args.action == 'evaluate' and not 1 <= args.timeout <= 7200:
+        parser.error('timeout 必须为 1–7200 秒')
     command = None
     if args.action in ('run', 'validate-policy'):
         if not 1 <= getattr(args, 'rounds', 1) <= 100 or not 1 <= args.timeout <= 7200:
@@ -109,21 +123,25 @@ def main():
                                 shlex.split(args.reviewer) if args.reviewer else None)
     if args.action == 'solve':
         settings = {name: getattr(args, name) for name in ('max_calls', 'max_tokens', 'max_cost')}
-    if args.action == 'validate-policy':
+    if args.action in ('validate-policy', 'evaluate'):
         settings = {name: getattr(args, name) for name in (
             'max_calls', 'max_tokens', 'max_cost', 'max_call_tokens', 'max_prompt_chars', 'max_output_bytes')}
     task_command = None
     if getattr(args, 'task_backend', None):
         task_command = backend_command(args.task_backend, 'task', args.task_model,
-                                       args.base_url, args.api_key_env, getattr(args, 'timeout', 300), codex_isolated=args.codex_isolated)
+                                       args.base_url, args.api_key_env, getattr(args, 'timeout', 300), codex_isolated=args.codex_isolated,
+                                       max_output_tokens=args.task_output_tokens, thinking=args.task_thinking)
     try:
         engine = Engine(args.state, command, getattr(args, "timeout", 300), task_command=task_command,
-                        benchmark=getattr(args, 'benchmark', None), **settings)
+                        benchmark=getattr(args, 'benchmark', None),
+                        datadesk_size=getattr(args, 'datadesk_size', None), **settings)
     except ValueError as error:
         parser.error(str(error))
     if args.action == "run":
         if args.demo and engine.task_command:
             parser.error('--demo cannot reuse a state configured with a task model; choose a new state')
+        if engine.benchmark == 'datadesk' and (args.demo or not engine.task_command):
+            parser.error('datadesk requires --task-backend or a saved task model; --demo is not a DataDesk model')
         engine.run(args.rounds)
         return
     if args.action == "solve":
@@ -144,10 +162,15 @@ def main():
             result = engine.validate_versions(args.seeds)
         elif args.action == 'validate-policy':
             result = engine.validate_policy()
+        elif args.action == 'evaluate':
+            result = {'active':state['active'], 'evaluation':engine.score(
+                engine.version(state['active']), args.seed, heldout=args.split == 'heldout')}
+            from .engine import atomic_json
+            atomic_json(engine.root / 'evaluation.json', result)
         elif args.action == "heldout":
             # Heldout results are not added to the proposal history.
             result = {"active": state["active"], "evaluation": engine.score(
-                engine.version(state["active"]), seed=982451653)}
+                engine.version(state["active"]), seed=982451653, heldout=True)}
             from .engine import atomic_json
             atomic_json(engine.root / "heldout.json", result)
         else:

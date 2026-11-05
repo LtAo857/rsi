@@ -137,7 +137,7 @@ def apply_patch_response(root, response):
     writes = []
     for name, content in response['files'].items():
         path = Path(name)
-        allowed = (name == 'solution.py' if repair else
+        allowed = (name == 'solution.py' or name == 'helpers.py' and (root / 'helpers.py').is_file() if repair else
                    bool(path.parts) and path.parts[0] in ('agent', 'evolution')
                    and path.suffix in ('.py', '.md', '.json'))
         if (path.is_absolute() or '..' in path.parts or not allowed or
@@ -198,13 +198,13 @@ def main():
             prompt = messages['system'] + '\n\n' + messages['prompt']
         if args.role == 'coder' and args.backend == 'deepseek':
             root = Path.cwd()
-            names = ([Path('solution.py'), Path('test_solution.py')] if (root / 'solution.py').exists()
+            names = ([Path('solution.py'), Path('helpers.py'), Path('test_solution.py')] if (root / 'solution.py').exists()
                      else [p for folder in ('agent', 'evolution') for p in Path(folder).rglob('*')
                            if p.is_file() and not p.is_symlink() and '__pycache__' not in p.parts])
             sources = {str(p):p.read_text() for p in names if p.exists()}
             prompt += ('\nReturn one JSON object: {"files":{"relative/path":"complete new source or null to delete"},'
                        '"proposal":{"analysis":"evidence analysis","changes":[]}}. '
-                       'List only changed files. In repair tasks only solution.py may change and no proposal is needed. '
+                       'List only changed files. In repair tasks solution.py and an existing helpers.py may change; preserve tests and no proposal is needed. '
                        'For candidate patches proposal must follow supervisor requirements. Current files:\n'
                        + json.dumps(sources, ensure_ascii=False))
         if args.backend == 'deepseek':

@@ -22,7 +22,7 @@ import uuid
 from .backends import ModelUnavailable
 from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace, patch_stats,
                      review_proposal, candidate_workspace)
-from .evaluation import REPAIR_SOURCE, REPAIR_TESTS, repair_goal, tasks
+from .evaluation import repair_case, tasks
 
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("worker.py")
@@ -50,7 +50,7 @@ def identity(root):
 
 
 class Engine:
-    def __init__(self, state_dir, command=None, timeout=300, task_command=None, **settings):
+    def __init__(self, state_dir, command=None, timeout=300, task_command=None, benchmark=None, **settings):
         self.root = Path(state_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.versions = self.root / "versions"
@@ -61,6 +61,12 @@ class Engine:
         self.search = SearchSettings(**settings)
         runtime_path = self.root / 'runtime.json'
         saved = json.loads(runtime_path.read_text()) if runtime_path.exists() else None
+        saved_benchmark = saved.get('benchmark', 'basic') if saved else 'basic'
+        self.benchmark = benchmark or saved_benchmark
+        if self.benchmark not in ('basic', 'advanced'):
+            raise ValueError('unknown benchmark suite')
+        if (saved or self.state_path.exists()) and self.benchmark != saved_benchmark:
+            raise ValueError('benchmark changed; use a new state directory')
         if saved is not None and task_command is not None and saved['task_command'] != task_command:
             raise ValueError('task model configuration changed; use a new state directory')
         if saved is None and task_command is not None and self.state_path.exists():
@@ -160,12 +166,12 @@ class Engine:
         return version_id
 
     def initialize(self):
-        if self.task_command:
+        if self.task_command or self.benchmark != 'basic':
             runtime = self.root / 'runtime.json'
             if runtime.exists() and json.loads(runtime.read_text())['task_command'] != self.task_command:
                 raise ValueError('task model configuration changed; use a new state directory')
             if not runtime.exists():
-                atomic_json(runtime, {'task_command':self.task_command})
+                atomic_json(runtime, {'task_command':self.task_command, 'benchmark':self.benchmark})
         if self.state_path.exists():
             return self.state()
         with tempfile.TemporaryDirectory(prefix="rsi-seed-") as directory:
@@ -208,8 +214,73 @@ class Engine:
                 raise ValueError("outside mutable scope: " + relative)
             if (candidate / relative).stat().st_size > 200_000:
                 raise ValueError("source file too large")
+            if relative.endswith('.py'):
+                try:
+                    compile((candidate / relative).read_bytes(), relative, 'exec')
+                except (SyntaxError, ValueError) as error:
+                    raise ValueError('invalid Python source: ' + relative) from error
         if not all(relative in files for relative in REQUIRED):
             raise ValueError("required interfaces were removed")
+
+    def archive_failure(self, candidate, current, audit):
+        """Preserve bounded, untrusted source even when normal validation never ran.
+
+        Never follow symlinks or copy Git control files. Incomplete archives are
+        explicit: an invalid candidate must not prevent publishing its diagnosis.
+        """
+        destination = audit / 'rejected-source'
+        destination.mkdir(exist_ok=True)
+        saved, skipped, errors, patch = [], [], [], []
+        remaining = 2_000_000
+        paths = set()
+        for folder in ('agent', 'evolution'):
+            for root in (candidate, current):
+                base = root / folder
+                if base.is_dir() and not base.is_symlink():
+                    paths.update(p.relative_to(root) for p in base.rglob('*') if not p.is_dir())
+        paths.add(Path('.rsi-proposal.json'))
+        for relative in sorted(paths):
+            versions = []
+            for root in (current, candidate):
+                source = root / relative
+                try:
+                    if any((root / Path(*relative.parts[:i])).is_symlink()
+                           for i in range(1, len(relative.parts) + 1)):
+                        if root == candidate:
+                            skipped.append({'path': str(relative), 'reason': 'symlink'})
+                        versions.append(None)
+                        continue
+                    if not source.is_file():
+                        versions.append(b'')
+                        continue
+                    with source.open('rb') as stream:
+                        data = stream.read(200_001)
+                    if len(data) > 200_000 or len(data) > remaining:
+                        if root == candidate:
+                            skipped.append({'path': str(relative), 'reason': 'size limit'})
+                        versions.append(None)
+                        continue
+                    if root == candidate:
+                        target = destination / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(data)
+                        remaining -= len(data)
+                        saved.append(str(relative))
+                    versions.append(data)
+                except OSError as error:
+                    errors.append({'path': str(relative), 'reason': str(error)})
+                    versions.append(None)
+            if all(value is not None for value in versions):
+                patch.extend(difflib.unified_diff(
+                    versions[0].decode(errors='replace').splitlines(True),
+                    versions[1].decode(errors='replace').splitlines(True),
+                    fromfile='before/' + str(relative), tofile='after/' + str(relative)))
+        (audit / 'rejected-changes.patch').write_text(''.join(patch))
+        metadata = {'saved': saved, 'skipped': skipped, 'errors': errors,
+                    'complete': not skipped and not errors,
+                    'scope': 'agent/, evolution/, proposal; excludes symlinks and Git metadata'}
+        atomic_json(audit / 'rejected-archive.json', metadata)
+        return metadata
 
     def code(self, workspace, prompt, log, command=None):
         command = command or self.command
@@ -290,14 +361,44 @@ class Engine:
     def trials(self, root, audit, label, seed, first=None):
         rows = []
         for i in range(self.search.trials):
+            cache = None
+            if self.search.cache_baseline and label == 'base-meta':
+                # Initial baseline only: confirmation and candidate trials stay fresh.
+                # Hash the environment, never write its credential values to disk.
+                context = [identity(root), self.benchmark, seed + i, self.command,
+                           self.task_command, self.timeout, sys.version,
+                           sorted(os.environ.items()),
+                           [(name, hashlib.sha256((SOURCE / 'kernel' / name).read_bytes()).hexdigest())
+                            for name in ('engine.py', 'evaluation.py', 'worker.py', 'backends.py', 'search.py')]]
+                key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+                cache = self.root / 'baseline-cache' / (key + '.json')
+                if cache.exists():
+                    cached = json.loads(cache.read_text())
+                    atomic_json(audit / f'{label}-{i}.tasks.json', cached['evaluation'])
+                    atomic_json(audit / f'{label}-{i}.cache.json', {'hit': True, 'key': key})
+                    for suffix, value in cached['artifacts'].items():
+                        if suffix in ('.trace.json', '.case.json'):
+                            atomic_json(audit / f'{label}-{i}{suffix}', value)
+                    rows.append(cached['row'])
+                    continue
             evaluation = first if i == 0 and first is not None else self.score(root, seed + i)
             atomic_json(audit / f'{label}-{i}.tasks.json', evaluation)
-            rows.append([evaluation['score'], self.meta_probe(root, audit, f'{label}-{i}')])
+            row = [evaluation['score'], self.meta_probe(root, audit, f'{label}-{i}',
+                                                       case_index=(seed % 10000) + i)]
+            rows.append(row)
+            if cache is not None:
+                cache.parent.mkdir(exist_ok=True)
+                artifacts = {}
+                for suffix in ('.trace.json', '.case.json'):
+                    path = audit / f'{label}-{i}{suffix}'
+                    if path.exists():
+                        artifacts[suffix] = json.loads(path.read_text())
+                atomic_json(cache, {'evaluation': evaluation, 'row': row, 'artifacts': artifacts})
         return rows
 
     def score(self, root, seed):
         rows = []
-        for task, expected in tasks(seed):
+        for task, expected in tasks(seed, suite=self.benchmark):
             try:
                 answer = self.call(root, "solve", task=task)
                 success = (isinstance(answer, (int, float)) and not isinstance(answer, bool)
@@ -309,39 +410,41 @@ class Engine:
                 rows.append({"task": task, "ok": False, "error": str(error)[-1000:]})
         return {"score": sum(row["ok"] for row in rows) / len(rows), "traces": rows}
 
-    def meta_probe(self, root, audit, label):
+    def meta_probe(self, root, audit, label, case_index=0):
         # Exercise the generation's own policy on a separate code-repair task.
         # Scoring is done here, not by the candidate or the coding model.
-        prompt = self.call(root, "plan", evidence={"failure": "total ignores later values"},
-                           goal=repair_goal())
+        case = repair_case(self.benchmark, case_index)
+        atomic_json(audit / (label + '.case.json'), {'name': case['name']})
+        prompt = self.call(root, "plan", evidence={"failure": case['failure']}, goal=case['goal'])
         with tempfile.TemporaryDirectory(prefix="rsi-meta-") as directory:
             workspace = Path(directory)
-            (workspace / "solution.py").write_text(REPAIR_SOURCE)
-            (workspace / "test_solution.py").write_text(REPAIR_TESTS)
-            original_tests = (workspace / "test_solution.py").read_bytes()
+            for name, source in case['files'].items():
+                (workspace / name).write_text(source)
+            protected = {name: (workspace / name).read_bytes() for name in case['files']
+                         if name not in case['mutable']}
             try:
                 self.code(workspace, prompt, audit / (label + ".log"))
             except TraceFailure:
                 return 0.0
-            if (workspace / "test_solution.py").read_bytes() != original_tests:
+            if any(not (workspace / name).is_file() or (workspace / name).read_bytes() != value
+                   for name, value in protected.items()):
                 return 0.0
             files = manifest(workspace)
-            if set(files) != {"solution.py", "test_solution.py"}:
+            if set(files) != set(case['files']):
                 return 0.0
             # Fresh supervisor-only test values, including negatives and floats.
-            program = ("import json; from solution import total; "
-                       "print(json.dumps([total(v) for v in "
-                       "[[], [2,3], [-7,4,10], [0.5,1.25], [8]]]))")
+            program = 'import json; ' + case['imports'] + '; print(json.dumps(' + case['expression'] + '))'
             result = subprocess.run([sys.executable, "-B", "-c", program], cwd=workspace,
                                     capture_output=True, text=True, timeout=30)
             if result.returncode:
                 return 0.0
             try:
                 answers = json.loads(result.stdout)
-                expected = [0, 5, 7, 1.75, 8]
+                expected = case['expected']
                 if not isinstance(answers, list) or len(answers) != len(expected):
                     return 0.0
-                return sum(type(a) in (int, float) and a == b
+                return sum(type(a) is type(b) and a == b or
+                           type(a) in (int, float) and type(b) in (int, float) and a == b
                            for a, b in zip(answers, expected)) / len(expected)
             except (ValueError, TypeError):
                 return 0.0
@@ -358,8 +461,8 @@ class Engine:
         number = state["round"]
         audit = self.root / "rounds" / f"{number:04d}-{uuid.uuid4().hex[:8]}"
         audit.mkdir(parents=True)
-        old = self.score(current, seed=number + 10)
-        old_trials = self.trials(current, audit, "base-meta", number + 10, first=old)
+        old_trials = self.trials(current, audit, "base-meta", number + 10)
+        old = json.loads((audit / 'base-meta-0.tasks.json').read_text())
         old_meta = sum(row[1] for row in old_trials) / len(old_trials)
         evidence = {"task_evaluation": old, "improvement_score": old_meta,
                     **self.search_evidence()}
@@ -385,6 +488,9 @@ class Engine:
         if self.task_command:
             goal += " Preserve build_messages(task) returning system/prompt strings and solve(task, llm=None). The task runtime supports one stateless model call per task."
         prompt = self.call(current, "plan", evidence=evidence, goal=goal)
+        evidence_block = '\nEvidence:\n' + json.dumps(evidence, ensure_ascii=False)
+        if prompt.endswith(evidence_block):
+            prompt = prompt[:-len(evidence_block)]
         prompt += ("\nSupervisor requirements: Read Evidence before editing. Write .rsi-proposal.json "
                    "with analysis (evidence and cause), and changes: a list of objects containing "
                    "files, failure_id, cause, expected_effect, validation. Each changed file must "
@@ -404,8 +510,10 @@ class Engine:
                   "trials": {"baseline": old_trials}}
         with candidate_workspace(current, self.search.worktrees) as candidate:
             try:
+                record['stage'] = 'coding'
                 git_control = (candidate / ".git").read_bytes() if self.search.worktrees else None
                 self.code(candidate, prompt, audit / "coder.log")
+                record['stage'] = 'proposal_validation'
                 if self.search.worktrees:
                     if (candidate / ".git").read_bytes() != git_control:
                         raise ValueError("candidate changed Git metadata")
@@ -432,7 +540,10 @@ class Engine:
                 stats = patch_stats(current, candidate)
                 record["changed"] = stats["files"]
                 review = review_proposal(proposal, stats, evidence)
+                # Cheap deterministic gates precede potentially paid model review.
+                self.health(candidate)
                 if self.search.reviewer:
+                    record['stage'] = 'review'
                     # The reviewer receives a disposable copy; any source mutation is rejected.
                     with tempfile.TemporaryDirectory(prefix="rsi-review-") as directory:
                         review_root = Path(directory) / "source"
@@ -460,7 +571,6 @@ class Engine:
                 atomic_json(audit / "review.json", review)
                 if not review["approved"]:
                     raise ValueError("reviewer rejected: " + str(review["independent"].get("reason", "")))
-                self.health(candidate)
                 candidate_id = identity(candidate)
                 if candidate_id == state["active"]:
                     raise ValueError("no source changes")
@@ -468,12 +578,14 @@ class Engine:
                 after = manifest(candidate)
                 record["changed"] = [p for p in sorted(set(before) | set(after))
                                      if before.get(p) != after.get(p)]
+                record['stage'] = 'candidate_evaluation'
                 new = self.score(candidate, seed=number + 10)
                 new_trials = self.trials(candidate, audit, "candidate-meta", number + 10, first=new)
                 record["candidate"] = [sum(r[d] for r in new_trials) / len(new_trials) for d in range(2)]
                 record["trials"]["candidate"] = new_trials
                 atomic_json(audit / "evaluation.json", new)
                 if confirmed_gain(new_trials, old_trials, self.search.noise_floor, evidence["search"]["prune"]):
+                    record['stage'] = 'confirmation'
                     base_confirm = self.trials(current, audit, "base-confirm-meta", number + 10010)
                     confirm = self.trials(candidate, audit, "confirm-meta", number + 10010)
                     record["trials"].update(confirmation=confirm, baseline_confirmation=base_confirm)
@@ -483,11 +595,17 @@ class Engine:
                         # Activation readiness is checked from the published generation.
                         self.health(self.version(version_id))
                         state.update(previous=state["active"], active=version_id)
-                        record.update(accepted=True, active=version_id)
+                        record.update(accepted=True, active=version_id, stage='activated')
                 if not record["accepted"]:
                     record["reason"] = "no confirmed improvement without regression"
             except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError) as error:
                 record["reason"] = str(error)
+            finally:
+                if not record['accepted']:
+                    try:
+                        record['archive'] = self.archive_failure(candidate, current, audit)
+                    except OSError as error:
+                        record['archive_error'] = str(error)
         state["round"] += 1
         atomic_json(self.state_path, state)
         atomic_json(audit / "result.json", record)

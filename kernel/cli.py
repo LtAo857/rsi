@@ -24,6 +24,8 @@ def main():
     run.add_argument("--coder-model", default="", help="编码模型名，Codex 留空使用本机配置")
     mode.add_argument("--demo", action="store_true", help="确定性离线演示，不调用模型")
     run.add_argument('--trials', type=int, default=2, help='每阶段配对评测次数')
+    run.add_argument('--benchmark', choices=['basic', 'advanced'],
+                     help='评测套件；advanced 增加条件聚合、分组与多类代码修复，选择后锁定')
     run.add_argument('--noise-floor', type=float, default=.01, help='最小有效分数提升')
     run.add_argument('--edit-budget', type=int, default=200, help='初始新增加删除行数上限')
     run.add_argument('--min-edit-budget', type=int, default=20)
@@ -38,6 +40,7 @@ def main():
     run.add_argument('--reviewer-model', default='')
     review_mode.add_argument('--reviewer', help='独立审查命令，stdin 接收 JSON，stdout 输出批准结论')
     run.add_argument('--worktrees', action='store_true', help='为每个候选建立独立 Git worktree')
+    run.add_argument('--cache-baseline', action='store_true', help='复用同版本、同配置、同 trial 的已完成初评基线；确认评测不复用')
     solve = sub.add_parser("solve", help="使用当前已接受版本执行任务")
     solve.add_argument("task", help="包含 observation 和 operation 的 JSON")
     solve.add_argument('--max-calls', type=int)
@@ -71,7 +74,7 @@ def main():
     if args.action == 'run':
         settings = {name: getattr(args, name) for name in (
             'trials', 'noise_floor', 'edit_budget', 'min_edit_budget', 'decay',
-            'stagnation', 'prune_every', 'max_calls', 'max_tokens', 'max_cost', 'worktrees')}
+            'stagnation', 'prune_every', 'max_calls', 'max_tokens', 'max_cost', 'worktrees', 'cache_baseline')}
         settings['reviewer'] = (backend_command(args.reviewer_backend, 'reviewer', args.reviewer_model,
                                                 args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated)
                                 if args.reviewer_backend else
@@ -83,7 +86,8 @@ def main():
         task_command = backend_command(args.task_backend, 'task', args.task_model,
                                        args.base_url, args.api_key_env, getattr(args, 'timeout', 300), codex_isolated=args.codex_isolated)
     try:
-        engine = Engine(args.state, command, getattr(args, "timeout", 300), task_command=task_command, **settings)
+        engine = Engine(args.state, command, getattr(args, "timeout", 300), task_command=task_command,
+                        benchmark=getattr(args, 'benchmark', None), **settings)
     except ValueError as error:
         parser.error(str(error))
     if args.action == "run":

@@ -30,6 +30,7 @@ class SearchSettings:
     max_cost: float | None = None
     reviewer: list | None = None
     worktrees: bool = False
+    cache_baseline: bool = False
 
     def __post_init__(self):
         for name in ('trials', 'edit_budget', 'min_edit_budget', 'stagnation', 'prune_every'):

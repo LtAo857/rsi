@@ -20,6 +20,7 @@ import time
 import uuid
 
 from .backends import ModelUnavailable
+from .execution import CallLimit, run_bounded
 from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace, patch_stats,
                      review_proposal, candidate_workspace)
 from .evaluation import repair_case, tasks
@@ -286,6 +287,8 @@ class Engine:
         command = command or self.command
         if not command:
             raise RuntimeError("a coding command is required; use --coder or --demo")
+        if self.search.max_prompt_chars is not None and len(prompt) > self.search.max_prompt_chars:
+            raise RuntimeError('call prompt character limit exceeded before launch')
         usage_path = self.root / "usage.json"
         usage = (json.loads(usage_path.read_text()) if usage_path.exists() else
                  {"calls": 0, "tokens": 0, "cost_usd": 0.0,
@@ -303,9 +306,10 @@ class Engine:
         usage["unknown_tokens"] += 1
         usage["unknown_cost"] += 1
         atomic_json(usage_path, usage)
+        interrupted = None
         try:
-            process = subprocess.run(command, input=prompt, cwd=workspace,
-                                     text=True, capture_output=True, timeout=self.timeout)
+            process = run_bounded(command, prompt, workspace, self.timeout,
+                                  self.search.max_output_bytes, self.search.max_call_tokens)
         except subprocess.TimeoutExpired as error:
             def decoded(value):
                 return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
@@ -313,6 +317,9 @@ class Engine:
             atomic_json(log.with_suffix(".trace.json"), {"failures": ["timeout"],
                                                        "tokens": None, "cost_usd": None})
             raise
+        except CallLimit as error:
+            interrupted = error
+            process = subprocess.CompletedProcess(command, -1, error.stdout, error.stderr)
         log.write_text(process.stdout + "\n" + process.stderr)
         trace = inspect_trace(process.stdout)
         if process.returncode:
@@ -323,6 +330,8 @@ class Engine:
                 usage[key] += trace[key]
                 usage[missing] -= 1
         atomic_json(usage_path, usage)
+        if interrupted:
+            raise interrupted
         if process.returncode:
             raise RuntimeError(f"coding command failed ({process.returncode}); see {log}")
         for limit, key in ((self.search.max_tokens, "tokens"), (self.search.max_cost, "cost_usd")):
@@ -330,6 +339,10 @@ class Engine:
                 raise RuntimeError("usage missing for configured budget: " + key)
             if limit is not None and usage[key] > limit:
                 raise RuntimeError("budget exceeded: " + key)
+        if self.search.max_call_tokens is not None and trace['tokens'] is not None and trace['tokens'] > self.search.max_call_tokens:
+            raise RuntimeError('reported call token limit exceeded')
+        if self.search.max_call_tokens is not None and trace['tokens'] is None:
+            raise RuntimeError('usage missing for configured call token limit')
         if set(trace["failures"]) & {"give_up", "loop", "repeated_tool_call", "tool_error"}:
             raise TraceFailure("trace failure: " + ", ".join(trace["failures"]))
         return process.stdout
@@ -377,24 +390,42 @@ class Engine:
                     atomic_json(audit / f'{label}-{i}.tasks.json', cached['evaluation'])
                     atomic_json(audit / f'{label}-{i}.cache.json', {'hit': True, 'key': key})
                     for suffix, value in cached['artifacts'].items():
-                        if suffix in ('.trace.json', '.case.json'):
+                        if suffix in ('.trace.json', '.case.json', '.cost.json'):
                             atomic_json(audit / f'{label}-{i}{suffix}', value)
                     rows.append(cached['row'])
                     continue
+            usage_path = self.root / 'usage.json'
+            usage_before = json.loads(usage_path.read_text()) if usage_path.exists() else {'tokens':0, 'unknown_tokens':0}
             evaluation = first if i == 0 and first is not None else self.score(root, seed + i)
             atomic_json(audit / f'{label}-{i}.tasks.json', evaluation)
             row = [evaluation['score'], self.meta_probe(root, audit, f'{label}-{i}',
                                                        case_index=(seed % 10000) + i)]
             rows.append(row)
+            usage_after = json.loads(usage_path.read_text()) if usage_path.exists() else usage_before
+            tokens = (usage_after['tokens'] - usage_before['tokens']
+                      if usage_after['unknown_tokens'] == usage_before['unknown_tokens'] and first is None else None)
+            atomic_json(audit / f'{label}-{i}.cost.json', {'tokens':tokens})
             if cache is not None:
                 cache.parent.mkdir(exist_ok=True)
                 artifacts = {}
-                for suffix in ('.trace.json', '.case.json'):
+                for suffix in ('.trace.json', '.case.json', '.cost.json'):
                     path = audit / f'{label}-{i}{suffix}'
                     if path.exists():
                         artifacts[suffix] = json.loads(path.read_text())
                 atomic_json(cache, {'evaluation': evaluation, 'row': row, 'artifacts': artifacts})
         return rows
+
+    def accept_trials(self, candidate, baseline, audit, new_label, old_label, pruning=False):
+        def costs(label):
+            result = []
+            for i in range(len(candidate)):
+                path = audit / f'{label}-{i}.cost.json'
+                result.append(json.loads(path.read_text()).get('tokens') if path.exists() else None)
+            return result
+        return confirmed_gain(candidate, baseline, self.search.noise_floor, pruning,
+                              regression_tolerance=self.search.regression_tolerance,
+                              candidate_costs=costs(new_label), baseline_costs=costs(old_label),
+                              cost_band=self.search.cost_band)
 
     def score(self, root, seed):
         rows = []
@@ -480,6 +511,18 @@ class Engine:
         failures.append({"id": "complexity", "kind": "maintenance",
                          "description": "Remove redundant mechanisms without losing capability"})
         evidence["failures"] = failures
+        strategy = self.call(current, 'analyze', evidence=evidence)
+        if strategy is not None:
+            known = {row['id'] for row in failures}
+            if (not isinstance(strategy, dict) or
+                    not isinstance(strategy.get('failure_ids'), list) or
+                    not strategy['failure_ids'] or
+                    any(not isinstance(value, str) or value not in known for value in strategy['failure_ids']) or
+                    strategy.get('target') not in ('agent', 'evolution') or
+                    not isinstance(strategy.get('hypothesis'), str) or not strategy['hypothesis'].strip()):
+                raise ValueError('invalid mutable analysis strategy')
+            evidence['strategy'] = strategy
+            atomic_json(audit / 'strategy.json', strategy)
         goal = ("Improve this system's task solver AND its self-improvement policy. "
                 "Only agent/ and evolution/ may change. Preserve solve(task) and "
                 "build_prompt(evidence, goal). Do not access the supervisor, its state, "
@@ -494,7 +537,11 @@ class Engine:
         prompt += ("\nSupervisor requirements: Read Evidence before editing. Write .rsi-proposal.json "
                    "with analysis (evidence and cause), and changes: a list of objects containing "
                    "files, failure_id, cause, expected_effect, validation. Each changed file must "
-                   "reference a supplied failure ID. Obey Evidence.search edit_budget (added plus "
+                   "reference a supplied failure ID. If Evidence.strategy exists, EVERY change.failure_id "
+                   "must belong to Evidence.strategy.failure_ids, and at least one changed file must "
+                   "be in its target component unless Evidence.search.target overrides it. Other failures "
+                   "may be fixed incidentally but must not be cited as unselected failure IDs. "
+                   "Obey Evidence.search edit_budget (added plus "
                    "removed lines), target component, and prune (net deletion if true). "
                    "Do not alter kernel, tests or Git metadata.\nEvidence:\n"
                    + json.dumps(evidence, ensure_ascii=False))
@@ -579,18 +626,18 @@ class Engine:
                 record["changed"] = [p for p in sorted(set(before) | set(after))
                                      if before.get(p) != after.get(p)]
                 record['stage'] = 'candidate_evaluation'
-                new = self.score(candidate, seed=number + 10)
-                new_trials = self.trials(candidate, audit, "candidate-meta", number + 10, first=new)
+                new_trials = self.trials(candidate, audit, "candidate-meta", number + 10)
+                new = json.loads((audit / 'candidate-meta-0.tasks.json').read_text())
                 record["candidate"] = [sum(r[d] for r in new_trials) / len(new_trials) for d in range(2)]
                 record["trials"]["candidate"] = new_trials
                 atomic_json(audit / "evaluation.json", new)
-                if confirmed_gain(new_trials, old_trials, self.search.noise_floor, evidence["search"]["prune"]):
+                if self.accept_trials(new_trials, old_trials, audit, 'candidate-meta', 'base-meta', evidence['search']['prune']):
                     record['stage'] = 'confirmation'
                     base_confirm = self.trials(current, audit, "base-confirm-meta", number + 10010)
                     confirm = self.trials(candidate, audit, "confirm-meta", number + 10010)
                     record["trials"].update(confirmation=confirm, baseline_confirmation=base_confirm)
                     record["confirmation"] = [sum(r[d] for r in confirm) / len(confirm) for d in range(2)]
-                    if confirmed_gain(confirm, base_confirm, self.search.noise_floor, evidence["search"]["prune"]):
+                    if self.accept_trials(confirm, base_confirm, audit, 'confirm-meta', 'base-confirm-meta', evidence['search']['prune']):
                         version_id = self.publish(candidate)
                         # Activation readiness is checked from the published generation.
                         self.health(self.version(version_id))
@@ -652,3 +699,32 @@ class Engine:
             self.initialize()
             state = self.recover(self.state())
             return self.call(self.version(state["active"]), "solve", task=task)
+
+    def validate_versions(self, seeds=3):
+        """Compare initial and active versions on fresh inputs, outside search history.
+
+        Same task families with different values: this is not a claim of transfer
+        to unseen task types, and does not measure repair-policy generalization.
+        Caller must hold the supervisor lock.
+        """
+        if type(seeds) is not int or not 1 <= seeds <= 20:
+            raise ValueError('validation seeds must be in [1, 20]')
+        state = self.recover(self.state())
+        initialized = next(row for row in self.recent_history(limit=None)
+                           if row.get('type') == 'initialized')
+        baseline = self.version(initialized['active'])
+        active = self.version(state['active'])
+        rows = []
+        for i in range(seeds):
+            seed = 982451653 + i
+            before, after = self.score(baseline, seed), self.score(active, seed)
+            rows.append({'seed':seed, 'baseline':before['score'], 'active':after['score'],
+                         'improved':sum(not a['ok'] and b['ok'] for a,b in zip(before['traces'],after['traces'])),
+                         'regressed':sum(a['ok'] and not b['ok'] for a,b in zip(before['traces'],after['traces']))})
+        result = {'baseline_version':initialized['active'], 'active_version':state['active'],
+                  'benchmark':self.benchmark, 'seeds':rows,
+                  'baseline_score':sum(r['baseline'] for r in rows) / len(rows),
+                  'active_score':sum(r['active'] for r in rows) / len(rows),
+                  'scope':'fresh inputs in existing task families; not policy or unseen-family validation'}
+        atomic_json(self.root / 'validation.json', result)
+        return result

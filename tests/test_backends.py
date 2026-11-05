@@ -29,7 +29,7 @@ class BackendTests(unittest.TestCase):
             def do_POST(self):
                 payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 owner.requests.append((self.path, self.headers.get('Authorization'), payload))
-                body = {'choices':[{'message':{'content':owner.reply}}],
+                body = {'choices':[{'message':{'content':owner.reply}, 'finish_reason':owner.finish_reason}],
                         'usage':{'prompt_tokens':12, 'completion_tokens':3}}
                 self.send_response(owner.status)
                 self.send_header('Content-Type', 'application/json')
@@ -40,6 +40,7 @@ class BackendTests(unittest.TestCase):
                 pass
 
         self.reply = '5'
+        self.finish_reason = 'stop'
         server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -246,6 +247,36 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':20,'cached_inp
         with self.assertRaisesRegex(RuntimeError, 'budget'):
             engine.solve({'operation':'sum','observation':'{"values":[2,3]}'})
         self.assertEqual(len(self.requests), 1)
+
+    def test_deepseek_provider_output_cap_is_sent_to_service(self):
+        from kernel.backends import deepseek_completion
+        text, usage = deepseek_completion('Return 5', 'test-model', self.url, 'RSI_TEST_KEY',
+                                          max_output_tokens=512)
+        self.assertEqual(text, '5')
+        self.assertEqual(self.requests[-1][2]['max_tokens'], 512)
+
+    def test_thinking_mode_is_explicit_and_truncation_preserves_usage(self):
+        from kernel.backends import deepseek_completion, ResponseTruncated
+        self.finish_reason = 'length'
+        with self.assertRaises(ResponseTruncated) as error:
+            deepseek_completion('Return JSON', 'test-model', self.url, 'RSI_TEST_KEY',
+                                max_output_tokens=512, thinking='disabled')
+        self.assertEqual(error.exception.usage['output_tokens'], 3)
+        self.assertEqual(self.requests[-1][2]['thinking'], {'type':'disabled'})
+
+    def test_truncated_patch_is_not_written_but_usage_is_reported(self):
+        candidate = self.root / 'candidate'
+        (candidate / 'agent').mkdir(parents=True)
+        source = candidate / 'agent/solver.py'
+        source.write_text('old=True\n')
+        self.reply = '{"files":'
+        self.finish_reason = 'length'
+        result = subprocess.run(self.command('coder'), input='Fix code', capture_output=True,
+                                text=True, cwd=candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('truncated', result.stderr)
+        self.assertEqual(source.read_text(), 'old=True\n')
+        self.assertEqual(json.loads(result.stdout)['output_tokens'], 3)
 
 
 if __name__ == '__main__':

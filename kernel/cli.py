@@ -27,6 +27,8 @@ def main():
     run.add_argument('--benchmark', choices=['basic', 'advanced'],
                      help='评测套件；advanced 增加条件聚合、分组与多类代码修复，选择后锁定')
     run.add_argument('--noise-floor', type=float, default=.01, help='最小有效分数提升')
+    run.add_argument('--regression-tolerance', type=float, default=0.0, help='可选配对置信下界容忍，默认逐 trial 不退步')
+    run.add_argument('--cost-band', type=float, default=.05, help='接受等能力降本版本所需的最小 token 节省比例')
     run.add_argument('--edit-budget', type=int, default=200, help='初始新增加删除行数上限')
     run.add_argument('--min-edit-budget', type=int, default=20)
     run.add_argument('--decay', type=float, default=.9)
@@ -41,6 +43,11 @@ def main():
     review_mode.add_argument('--reviewer', help='独立审查命令，stdin 接收 JSON，stdout 输出批准结论')
     run.add_argument('--worktrees', action='store_true', help='为每个候选建立独立 Git worktree')
     run.add_argument('--cache-baseline', action='store_true', help='复用同版本、同配置、同 trial 的已完成初评基线；确认评测不复用')
+    run.add_argument('--max-call-tokens', type=int, help='单次调用已报告 token 阈值；并非服务端总费用硬限额')
+    run.add_argument('--max-prompt-chars', type=int, help='启动前限制提示词字符数')
+    run.add_argument('--max-output-bytes', type=int, help='限制单次子进程输出字节数')
+    run.add_argument('--provider-output-tokens', type=int, help='DeepSeek 服务端输出 token 上限')
+    run.add_argument('--deepseek-thinking', choices=['enabled','disabled'], help='显式控制 DeepSeek 思考模式')
     solve = sub.add_parser("solve", help="使用当前已接受版本执行任务")
     solve.add_argument("task", help="包含 observation 和 operation 的 JSON")
     solve.add_argument('--max-calls', type=int)
@@ -54,6 +61,8 @@ def main():
         command_parser.add_argument('--api-key-env', help='存放 API 密钥的环境变量名')
     sub.add_parser("status", help="查看版本与改进历史")
     sub.add_parser("heldout", help="最终留出集验证，不参与版本选择")
+    validate = sub.add_parser('validate', help='在多个新种子上比较初始与当前版本，不参与搜索')
+    validate.add_argument('--seeds', type=int, default=3)
     sub.add_parser("stop", help="当前轮完成后停止")
     sub.add_parser("resume", help="清除停止标记")
     args = parser.parse_args()
@@ -67,16 +76,21 @@ def main():
             command = [sys.executable, '-B', str(SOURCE / 'examples' / 'demo_coder.py')]
         elif args.coder_backend:
             command = backend_command(args.coder_backend, 'coder', args.coder_model,
-                                      args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated)
+                                      args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated,
+                                      max_output_tokens=args.provider_output_tokens,
+                                      thinking=args.deepseek_thinking)
         else:
             command = shlex.split(args.coder)
     settings = {}
     if args.action == 'run':
         settings = {name: getattr(args, name) for name in (
             'trials', 'noise_floor', 'edit_budget', 'min_edit_budget', 'decay',
-            'stagnation', 'prune_every', 'max_calls', 'max_tokens', 'max_cost', 'worktrees', 'cache_baseline')}
+            'stagnation', 'prune_every', 'max_calls', 'max_tokens', 'max_cost', 'worktrees', 'cache_baseline',
+            'regression_tolerance', 'cost_band', 'max_call_tokens', 'max_prompt_chars', 'max_output_bytes')}
         settings['reviewer'] = (backend_command(args.reviewer_backend, 'reviewer', args.reviewer_model,
-                                                args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated)
+                                                args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated,
+                                                max_output_tokens=args.provider_output_tokens if args.reviewer_backend == 'deepseek' else None,
+                                                thinking=args.deepseek_thinking if args.reviewer_backend == 'deepseek' else None)
                                 if args.reviewer_backend else
                                 shlex.split(args.reviewer) if args.reviewer else None)
     if args.action == 'solve':
@@ -109,7 +123,9 @@ def main():
     with engine.lock():
         engine.initialize()
         state = engine.recover(engine.state())
-        if args.action == "heldout":
+        if args.action == 'validate':
+            result = engine.validate_versions(args.seeds)
+        elif args.action == "heldout":
             # Heldout results are not added to the proposal history.
             result = {"active": state["active"], "evaluation": engine.score(
                 engine.version(state["active"]), seed=982451653)}

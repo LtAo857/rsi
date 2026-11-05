@@ -98,6 +98,44 @@ python3 -m unittest discover -s tests -v
 
 ## 正则化搜索与证据协议
 
+### 可变策略、成本选择与调用限制（2026-11-05）
+
+`evolution/policy.py` 现在可提供 `analyze(evidence)`，返回 `failure_ids`、`target` 和
+`hypothesis`。当前版本的策略先选择失败项和改进方向，内核验证其引用与目标，随后生成
+修改提案；提案必须引用策略选中的失败项，并修改目标组件。停滞时固定探索目标优先。
+旧版本没有 analyze 时仍可运行。剪枝轮的初始策略会选择维护目标。
+这是可执行的独立诊断阶段，尚不能证明语义归因正确，也没有独立 LLM 分析方。
+
+普通轮现在可接受同等能力下明显更省 token 的版本。每个 trial 的任务执行与修复探针用量
+保存在 `.cost.json`，两阶段都需通过成本比较；缺失、零用量或不充分的报告不能作为降本证据。
+`--cost-band` 默认 0.05。`--regression-tolerance` 默认 0，保持逐 trial 不退步；显式设为
+正数时，使用配对差值的正态近似下界控制允许退步，并仍要求能力提升或成本收益。
+该小样本规则不是严格统计保证，成本也是工具报告的 token 代理，不是美元账单。
+
+新增可选限制：
+
+- `--max-prompt-chars`：启动前限制提示字符数。
+- `--max-output-bytes`：运行中限制子进程 stdout/stderr 总字节。
+- `--max-call-tokens`：检查调用已报告 token，收到超过阈值的用量事件时终止进程组；
+  未报告用量则拒绝。若后端缓存事件到调用结束，检查也只能在结束时发生。
+- `--provider-output-tokens`：向 DeepSeek 服务端传递输出上限；不约束输入费用与总账单。
+- `--deepseek-thinking disabled`：显式关闭 DeepSeek 思考模式，不改变全局配置；默认不覆盖服务端设置。
+
+DeepSeek 返回 `finish_reason=length` 时明确报告截断、保留 usage，不应用不完整补丁。
+参数依据 [DeepSeek 官方说明](https://api-docs.deepseek.com/guides/thinking_mode/) 及
+[Chat Completions 协议](https://api-docs.deepseek.com/api/create-chat-completion/)。
+超时或超限会清理本次子进程组，但服务端已发生的费用无法由本地进程撤销。
+
+`python3 -m kernel --state EXPERIMENT validate --seeds 5` 比较初始与当前版本的新输入表现；
+结果保存为 validation.json，不反馈给搜索。默认仍是原任务类型，不表示跨任务类型泛化，
+也不衡量改进策略在陌生修复项目上的泛化。
+
+2026-11-05 真实模型实验完成了一次经审查与复评的发布，下一轮使用新策略继续运行。
+任务得分从 33.3% 提升到 100%，五个新种子共 60 题中 40 题改善、0 题退步。
+第二轮无足够收益被拒绝。详见 [真实实验与验证记录](docs/experiments/2026-11-05-live-improvement.md)。
+已通过版本的源码快照随实验文档保存；开发目录仍保留初始 Agent，便于复现实验。
+本批最终全量 75 项测试全部通过；真实模型实验、新输入验证与离线接口测试分别记录。
+
 ### 2026-11-05 评测与成本改进
 
 `--benchmark advanced` 提供六类任务和三类轮换修复探针；默认保留 basic，以兼容已有实验
@@ -218,9 +256,9 @@ python3 -m kernel --state .rsi-regularized run --demo --rounds 3 \
 | [x] | 停滞时强制探索未尝试组件 | 优先选择尝试最少的组件，未尝试组件计数为 0；所有组件都试过时选择最少者 | `search_evidence`、`review_proposal`；探索目标及强制执行测试 |
 | [x] | 评估前先过审查方 | 默认固定规则审查；可选 `--reviewer` 独立外部审查，有否决权 | `kernel/engine.py:round`；审查否决测试 |
 | [x] | 噪声带下限 | 重复配对 trial，提升需超过 noise_floor 和标准误差门槛，逐 trial 不得退步 | `kernel/search.py:confirmed_gain`；小提升、噪声、退步测试 |
-| [x] | token 成本规则 | 累计调用、token、美元预算与未知用量阻断；DeepSeek/Codex 内置适配 token，美元需额外报告，不能提供服务端硬限额 | `kernel/engine.py:code`；预算跨重启、未知用量和超限测试 |
+| [x] | token 成本规则 | 累计预算及未知用量阻断；另在初评和确认比较每 trial 已报告 token，明显降本且能力不退步可接受；不等于美元账单或服务端总费用硬限额 | `Engine.code`、`accept_trials`；预算、未知用量与成本选择测试 |
 | [ ] | 剪枝不再有用的机制 | **基础版**：周期性要求净删行，无退步时可接受；尚无逐机制消融实验，不能判断机制是否无用 | `review_proposal`、`confirmed_gain`；等分剪枝生命周期测试 |
-| [ ] | 分析方先读证据 | **基础版**：提示词要求先分析，提案必须含 analysis；尚无独立分析方和可验证的阅读顺序 | `evolution/policy.py`、提案协议；非空分析字段检查 |
+| [ ] | 分析方先读证据 | **部分实现**：可变 analyze 先执行并选择失败与方向，固定层验证、提案需遵循；尚无独立 LLM 分析方及语义阅读验证 | `evolution/policy.py`、worker analyze、策略约束测试 |
 | [x] | 每个候选一个 git worktree | 可选 `--worktrees`，临时仓库仅含可变源码，候选结束清理，仍以哈希快照发布 | `kernel/search.py:candidate_workspace`；worktree 生命周期测试 |
 
 ### kayba-ai/recursive-improve

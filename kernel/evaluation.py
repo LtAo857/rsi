@@ -32,7 +32,14 @@ def tasks(seed, count=12, suite="basic"):
             observation = json.dumps(payload)
             if i % 2:
                 observation = "Tool result:\n```json\n" + observation + "\n```"
-        result.append(({"observation": observation, "operation": operation}, expected))
+        task = {"observation": observation, "operation": operation}
+        if suite == 'advanced':
+            instructions = {'sum':'Sum values.', 'mean':'Arithmetic average of values.', 'count':'Number of values.',
+                            'filtered_sum':'Sum row.value only where row.value is strictly greater than threshold.',
+                            'weighted_mean':'Sum row.value * row.weight divided by sum row.weight.',
+                            'group_max_total':'Sum row.value within each group and return the largest group sum. Do not apply weights.'}
+            task['instruction'] = instructions[operation]
+        result.append((task, expected))
     return result
 
 

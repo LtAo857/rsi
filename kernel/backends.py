@@ -19,6 +19,12 @@ class ModelUnavailable(RuntimeError):
     """Provider failure, never evidence of candidate task incompetence."""
 
 
+class ResponseTruncated(ModelUnavailable):
+    def __init__(self, usage):
+        super().__init__('DeepSeek response truncated at provider output limit; partial patch not applied')
+        self.usage = usage
+
+
 def json_value(text):
     text = text.strip()
     if text.startswith('```'):
@@ -26,15 +32,24 @@ def json_value(text):
     return json.loads(text)
 
 
-def deepseek_completion(prompt, model, base_url, api_key_env, timeout=300):
+def deepseek_completion(prompt, model, base_url, api_key_env, timeout=300, max_output_tokens=None, thinking=None):
     key = os.environ.get(api_key_env)
     if not key:
         raise ModelUnavailable('missing API key environment variable: ' + api_key_env)
     if not model:
         raise ModelUnavailable('DeepSeek requires an explicit model or RSI_MODEL_NAME / DATADESK_MODEL_NAME')
-    body = json.dumps({'model':model, 'messages':[
+    payload = {'model':model, 'messages':[
         {'role':'system', 'content':'Follow the supplied protocol. Return only the requested output.'},
-        {'role':'user', 'content':prompt}], 'stream':False}).encode()
+        {'role':'user', 'content':prompt}], 'stream':False}
+    if max_output_tokens is not None:
+        if type(max_output_tokens) is not int or max_output_tokens < 1:
+            raise ValueError('max_output_tokens must be positive')
+        payload['max_tokens'] = max_output_tokens
+    if thinking is not None:
+        if thinking not in ('enabled', 'disabled'):
+            raise ValueError('invalid thinking mode')
+        payload['thinking'] = {'type':thinking}
+    body = json.dumps(payload).encode()
     request = urllib.request.Request(base_url.rstrip('/') + '/chat/completions', data=body,
                                      headers={'Content-Type':'application/json',
                                               'Authorization':'Bearer ' + key})
@@ -47,6 +62,11 @@ def deepseek_completion(prompt, model, base_url, api_key_env, timeout=300):
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         raise ModelUnavailable('DeepSeek transport or response failure') from None
     try:
+        native = data.get('usage') or {}
+        usage = {'type':'usage', 'input_tokens':native.get('prompt_tokens'),
+                 'output_tokens':native.get('completion_tokens')}
+        if data['choices'][0].get('finish_reason') == 'length':
+            raise ResponseTruncated(usage)
         text = data['choices'][0]['message']['content']
         if not isinstance(text, str):
             raise ValueError()
@@ -162,7 +182,8 @@ def apply_patch_response(root, response):
         manifest.write_text(json.dumps(response['proposal'], ensure_ascii=False))
 
 
-def backend_command(backend, role, model='', base_url=None, api_key_env=None, timeout=300, codex_isolated=False):
+def backend_command(backend, role, model='', base_url=None, api_key_env=None, timeout=300, codex_isolated=False,
+                    max_output_tokens=None, thinking=None):
     model = model or os.environ.get('RSI_MODEL_NAME', os.environ.get('DATADESK_MODEL_NAME', ''))
     base_url = base_url or os.environ.get('RSI_BASE_URL', os.environ.get('DATADESK_BASE_URL', 'https://api.deepseek.com/v1'))
     api_key_env = api_key_env or os.environ.get('RSI_API_KEY_ENV', os.environ.get('DATADESK_API_KEY_ENV', 'DEEPSEEK_API_KEY'))
@@ -176,6 +197,14 @@ def backend_command(backend, role, model='', base_url=None, api_key_env=None, ti
         command += ['--api-key-env', api_key_env]
     if backend == 'codex' and codex_isolated:
         command += ['--isolated']
+    if max_output_tokens is not None:
+        if backend != 'deepseek':
+            raise ValueError('provider output token cap is currently supported only for DeepSeek')
+        command += ['--max-output-tokens', str(max_output_tokens)]
+    if thinking is not None:
+        if backend != 'deepseek':
+            raise ValueError('thinking mode is currently supported only for DeepSeek')
+        command += ['--thinking', thinking]
     return command
 
 
@@ -188,6 +217,8 @@ def main():
     parser.add_argument('--api-key-env', default=os.environ.get('RSI_API_KEY_ENV', os.environ.get('DATADESK_API_KEY_ENV', 'DEEPSEEK_API_KEY')))
     parser.add_argument('--timeout', type=float, default=300)
     parser.add_argument('--isolated', action='store_true', help='Codex: ignore user config while preserving login')
+    parser.add_argument('--max-output-tokens', type=int)
+    parser.add_argument('--thinking', choices=['enabled', 'disabled'])
     args = parser.parse_args()
     prompt = sys.stdin.read()
     events = []
@@ -208,7 +239,8 @@ def main():
                        'For candidate patches proposal must follow supervisor requirements. Current files:\n'
                        + json.dumps(sources, ensure_ascii=False))
         if args.backend == 'deepseek':
-            text, usage = deepseek_completion(prompt, args.model, args.base_url, args.api_key_env, args.timeout)
+            text, usage = deepseek_completion(prompt, args.model, args.base_url, args.api_key_env, args.timeout,
+                                             args.max_output_tokens, args.thinking)
         else:
             text, usage = codex_completion(prompt, args.model, args.timeout,
                                            Path.cwd() if args.role == 'coder' else None, events, args.isolated)
@@ -223,6 +255,8 @@ def main():
         else:
             print(json.dumps({'model_response':text}, ensure_ascii=False))
     except ModelUnavailable as error:
+        if isinstance(error, ResponseTruncated):
+            usage = error.usage
         print('model unavailable: ' + str(error), file=sys.stderr)
         return 1
     except (ValueError, OSError, TypeError, KeyError):

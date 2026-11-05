@@ -23,7 +23,7 @@ from .backends import ModelUnavailable
 from .execution import CallLimit, run_bounded
 from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace, patch_stats,
                      review_proposal, candidate_workspace)
-from .evaluation import repair_case, tasks
+from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
 
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("worker.py")
@@ -149,12 +149,28 @@ class Engine:
             if not (root / relative).is_file():
                 raise ValueError("missing " + relative)
         self.call(root, "plan", evidence={}, goal="health check")
+        self.analyze(root, {'failures': [{'id': 'health', 'kind': 'maintenance'}]})
         value = self.call(root, "solve", use_model=False, task={"operation": "sum",
                                               "observation": '{"values": [2, 3]}'})
         if self.task_command:
             self.call(root, 'messages', task={'operation':'sum', 'observation':'{"values":[2,3]}'})
         if value != 5:
             raise ValueError("basic solver health check failed")
+
+    def analyze(self, root, evidence):
+        # Never give a replacement policy the incumbent's answer to echo.
+        evidence = {key: value for key, value in evidence.items() if key != 'strategy'}
+        strategy = self.call(root, 'analyze', evidence=evidence)
+        if strategy is None:  # Legacy generations may omit analyze entirely.
+            return None
+        known = {row['id'] for row in evidence.get('failures', [])}
+        if (not isinstance(strategy, dict) or
+                not isinstance(strategy.get('failure_ids'), list) or not strategy['failure_ids'] or
+                any(not isinstance(value, str) or value not in known for value in strategy['failure_ids']) or
+                strategy.get('target') not in ('agent', 'evolution') or
+                not isinstance(strategy.get('hypothesis'), str) or not strategy['hypothesis'].strip()):
+            raise ValueError('invalid mutable analysis strategy')
+        return strategy
 
     def publish(self, candidate):
         self.validate_tree(candidate)
@@ -444,7 +460,10 @@ class Engine:
     def meta_probe(self, root, audit, label, case_index=0):
         # Exercise the generation's own policy on a separate code-repair task.
         # Scoring is done here, not by the candidate or the coding model.
-        case = repair_case(self.benchmark, case_index)
+        return self.repair_probe(root, audit, label, repair_case(self.benchmark, case_index))
+
+    def repair_probe(self, root, audit, label, case):
+        """Score a supervisor-owned project without exposing hidden test values."""
         atomic_json(audit / (label + '.case.json'), {'name': case['name']})
         prompt = self.call(root, "plan", evidence={"failure": case['failure']}, goal=case['goal'])
         with tempfile.TemporaryDirectory(prefix="rsi-meta-") as directory:
@@ -464,7 +483,8 @@ class Engine:
             if set(files) != set(case['files']):
                 return 0.0
             # Fresh supervisor-only test values, including negatives and floats.
-            program = 'import json; ' + case['imports'] + '; print(json.dumps(' + case['expression'] + '))'
+            program = ('import json\n' + case['imports'] + '\n' + case.get('setup', '') +
+                       '\nprint(json.dumps(' + case['expression'] + '))')
             result = subprocess.run([sys.executable, "-B", "-c", program], cwd=workspace,
                                     capture_output=True, text=True, timeout=30)
             if result.returncode:
@@ -474,9 +494,7 @@ class Engine:
                 expected = case['expected']
                 if not isinstance(answers, list) or len(answers) != len(expected):
                     return 0.0
-                return sum(type(a) is type(b) and a == b or
-                           type(a) in (int, float) and type(b) in (int, float) and a == b
-                           for a, b in zip(answers, expected)) / len(expected)
+                return sum(answers_equal(a, b) for a, b in zip(answers, expected)) / len(expected)
             except (ValueError, TypeError):
                 return 0.0
 
@@ -511,16 +529,8 @@ class Engine:
         failures.append({"id": "complexity", "kind": "maintenance",
                          "description": "Remove redundant mechanisms without losing capability"})
         evidence["failures"] = failures
-        strategy = self.call(current, 'analyze', evidence=evidence)
+        strategy = self.analyze(current, evidence)
         if strategy is not None:
-            known = {row['id'] for row in failures}
-            if (not isinstance(strategy, dict) or
-                    not isinstance(strategy.get('failure_ids'), list) or
-                    not strategy['failure_ids'] or
-                    any(not isinstance(value, str) or value not in known for value in strategy['failure_ids']) or
-                    strategy.get('target') not in ('agent', 'evolution') or
-                    not isinstance(strategy.get('hypothesis'), str) or not strategy['hypothesis'].strip()):
-                raise ValueError('invalid mutable analysis strategy')
             evidence['strategy'] = strategy
             atomic_json(audit / 'strategy.json', strategy)
         goal = ("Improve this system's task solver AND its self-improvement policy. "
@@ -589,6 +599,7 @@ class Engine:
                 review = review_proposal(proposal, stats, evidence)
                 # Cheap deterministic gates precede potentially paid model review.
                 self.health(candidate)
+                self.analyze(candidate, evidence)
                 if self.search.reviewer:
                     record['stage'] = 'review'
                     # The reviewer receives a disposable copy; any source mutation is rejected.
@@ -727,4 +738,32 @@ class Engine:
                   'active_score':sum(r['active'] for r in rows) / len(rows),
                   'scope':'fresh inputs in existing task families; not policy or unseen-family validation'}
         atomic_json(self.root / 'validation.json', result)
+        return result
+
+    def validate_policy(self):
+        """Compare repair prompts on fixed projects excluded from search trials.
+
+        Caller holds the lock. Calls share the normal usage ledger and bounds;
+        validation artifacts never enter proposal history or version selection.
+        """
+        if not self.command:
+            raise ValueError('policy validation requires a coding command')
+        state = self.recover(self.state())
+        initial = next(row['active'] for row in self.recent_history(limit=None)
+                       if row.get('type') == 'initialized')
+        audit = self.root / 'policy-validation' / uuid.uuid4().hex
+        audit.mkdir(parents=True)
+        rows = []
+        for index, case in enumerate(heldout_repair_cases()):
+            row = {'case': case['name']}
+            for label, version in [('baseline', initial), ('active', state['active'])]:
+                row[label] = self.repair_probe(self.version(version), audit, f'{index}-{label}', case)
+            rows.append(row)
+        result = {'baseline_version': initial, 'active_version': state['active'], 'cases': rows,
+                  'baseline_score': sum(row['baseline'] for row in rows) / len(rows),
+                  'active_score': sum(row['active'] for row in rows) / len(rows),
+                  'audit': str(audit),
+                  'scope': 'fixed repair families excluded from search; one sample per version and project, not statistical evidence of general improvement'}
+        atomic_json(audit / 'result.json', result)
+        atomic_json(self.root / 'policy-validation.json', result)
         return result

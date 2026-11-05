@@ -63,14 +63,28 @@ def main():
     sub.add_parser("heldout", help="最终留出集验证，不参与版本选择")
     validate = sub.add_parser('validate', help='在多个新种子上比较初始与当前版本，不参与搜索')
     validate.add_argument('--seeds', type=int, default=3)
+    policy = sub.add_parser('validate-policy', help='在未参与搜索的固定修复项目上比较策略，会调用编码后端四次')
+    policy_mode = policy.add_mutually_exclusive_group(required=True)
+    policy_mode.add_argument('--coder', help='编码命令，提示词通过 stdin 传入')
+    policy_mode.add_argument('--coder-backend', choices=['codex', 'deepseek'])
+    policy.add_argument('--coder-model', default='')
+    policy.add_argument('--timeout', type=int, default=300)
+    policy.add_argument('--base-url')
+    policy.add_argument('--api-key-env')
+    policy.add_argument('--codex-isolated', action='store_true')
+    policy.add_argument('--provider-output-tokens', type=int)
+    policy.add_argument('--deepseek-thinking', choices=['enabled', 'disabled'])
+    for name in ('max-calls', 'max-tokens', 'max-call-tokens', 'max-prompt-chars', 'max-output-bytes'):
+        policy.add_argument('--' + name, type=int)
+    policy.add_argument('--max-cost', type=float)
     sub.add_parser("stop", help="当前轮完成后停止")
     sub.add_parser("resume", help="清除停止标记")
     args = parser.parse_args()
     command = None
-    if args.action == "run":
-        if not 1 <= args.rounds <= 100 or not 1 <= args.timeout <= 7200:
+    if args.action in ('run', 'validate-policy'):
+        if not 1 <= getattr(args, 'rounds', 1) <= 100 or not 1 <= args.timeout <= 7200:
             parser.error("rounds 必须为 1–100，timeout 必须为 1–7200 秒")
-        if args.demo:
+        if getattr(args, 'demo', False):
             if args.task_backend or args.reviewer_backend or args.reviewer:
                 parser.error('--demo must remain offline; use --coder-backend for model experiments')
             command = [sys.executable, '-B', str(SOURCE / 'examples' / 'demo_coder.py')]
@@ -95,6 +109,9 @@ def main():
                                 shlex.split(args.reviewer) if args.reviewer else None)
     if args.action == 'solve':
         settings = {name: getattr(args, name) for name in ('max_calls', 'max_tokens', 'max_cost')}
+    if args.action == 'validate-policy':
+        settings = {name: getattr(args, name) for name in (
+            'max_calls', 'max_tokens', 'max_cost', 'max_call_tokens', 'max_prompt_chars', 'max_output_bytes')}
     task_command = None
     if getattr(args, 'task_backend', None):
         task_command = backend_command(args.task_backend, 'task', args.task_model,
@@ -125,6 +142,8 @@ def main():
         state = engine.recover(engine.state())
         if args.action == 'validate':
             result = engine.validate_versions(args.seeds)
+        elif args.action == 'validate-policy':
+            result = engine.validate_policy()
         elif args.action == "heldout":
             # Heldout results are not added to the proposal history.
             result = {"active": state["active"], "evaluation": engine.score(

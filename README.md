@@ -130,6 +130,24 @@ DeepSeek 返回 `finish_reason=length` 时明确报告截断、保留 usage，�
 结果保存为 validation.json，不反馈给搜索。默认仍是原任务类型，不表示跨任务类型泛化，
 也不衡量改进策略在陌生修复项目上的泛化。
 
+新增 `validate-policy`，在不参与搜索评测的 CSV 解析、区间合并项目上，分别使用初始与当前
+策略产生修复提示词，交给同一个编码后端执行。共四次调用，计入状态目录的累计预算；
+`--max-calls` 等限制与 run 相同。结果存放在 `policy-validation.json` 和独立审计目录，
+不写入搜索历史，不决定是否启用版本。例如（真实模型调用会产生费用）：
+
+```bash
+python3 -m kernel --state EXPERIMENT validate-policy \
+  --coder-backend deepseek --coder-model deepseek-flash \
+  --deepseek-thinking disabled --provider-output-tokens 4096 --timeout 120
+```
+
+这些是仓库内固定的诊断项目，不是外部盲测；每个版本每个项目只采样一次，不能据此证明
+普遍的自我改进能力。本次只用离线脚本验证评分、预算及历史隔离，未执行新项目的真实模型实验。
+候选策略现在还需通过基础健康检查和本轮真实证据的 analyze 接口检查，格式错误或引用
+不存在失败项的策略会在启用前被拒绝。旧版缺少 analyze 仍保持兼容。
+验证记录见 [策略接管与留出评测测试](docs/experiments/2026-11-05-policy-validation.md)。
+本次新增 9 项测试，全量 84 项全部通过。
+
 2026-11-05 真实模型实验完成了一次经审查与复评的发布，下一轮使用新策略继续运行。
 任务得分从 33.3% 提升到 100%，五个新种子共 60 题中 40 题改善、0 题退步。
 第二轮无足够收益被拒绝。详见 [真实实验与验证记录](docs/experiments/2026-11-05-live-improvement.md)。
@@ -258,7 +276,7 @@ python3 -m kernel --state .rsi-regularized run --demo --rounds 3 \
 | [x] | 噪声带下限 | 重复配对 trial，提升需超过 noise_floor 和标准误差门槛，逐 trial 不得退步 | `kernel/search.py:confirmed_gain`；小提升、噪声、退步测试 |
 | [x] | token 成本规则 | 累计预算及未知用量阻断；另在初评和确认比较每 trial 已报告 token，明显降本且能力不退步可接受；不等于美元账单或服务端总费用硬限额 | `Engine.code`、`accept_trials`；预算、未知用量与成本选择测试 |
 | [ ] | 剪枝不再有用的机制 | **基础版**：周期性要求净删行，无退步时可接受；尚无逐机制消融实验，不能判断机制是否无用 | `review_proposal`、`confirmed_gain`；等分剪枝生命周期测试 |
-| [ ] | 分析方先读证据 | **部分实现**：可变 analyze 先执行并选择失败与方向，固定层验证、提案需遵循；尚无独立 LLM 分析方及语义阅读验证 | `evolution/policy.py`、worker analyze、策略约束测试 |
+| [ ] | 分析方先读证据 | **部分实现**：可变 analyze 先执行并选择失败与方向，固定层验证、提案需遵循；候选启用前检查其策略接口及本轮证据引用；尚无独立 LLM 分析方及语义阅读验证 | `evolution/policy.py`、worker analyze、`tests/test_policy_validation.py` |
 | [x] | 每个候选一个 git worktree | 可选 `--worktrees`，临时仓库仅含可变源码，候选结束清理，仍以哈希快照发布 | `kernel/search.py:candidate_workspace`；worktree 生命周期测试 |
 
 ### kayba-ai/recursive-improve
@@ -334,7 +352,7 @@ DeepSeek 模型名没有硬编码默认值，必须由参数或上述环境变�
 - [x] 真实 DeepSeek 连通性：`deepseek-flash` 单任务返回正确答案，报告 104 tokens。
 - [x] 真实 Codex 连通性：补齐系统代理桥接并开启 `--codex-isolated` 后，项目适配器单任务返回 5，耗时 26.64 秒，报告 22,957 tokens。
 - [x] 第一轮真实模型提案尝试：基线双指标满分，候选因 token 阈值超限被拒绝，未发布新版本。
-- [ ] 真实多轮改进与策略接管验证：尚未完成，不能从连通性或单轮拒绝推断持续改进能力。
+- [ ] 真实多轮改进与策略接管验证：部分完成；2026-11-05 一轮发布成功、下一轮使用新策略后因收益不足被拒绝。尚无持续多轮能力增长证据。
 - [ ] 完整 DataDesk CSV/SQL、多轮工具执行与任务集迁移。
 
 后端本轮验证（2026-11-02）：Python 3.12 下全部 38 项测试通过，其中 11 项验证模型后端，

@@ -91,3 +91,41 @@ def repair_case(suite="basic", index=0):
              "expression": "[unique_active([]), unique_active([{'email':' A@B ', 'active':True}, {'email':'a@b','active':True}, {'email':'c@d','active':False}]), normalize(' X@Y ')]",
              "expected": [0, 1, "x@y"]}]
     return cases[index % len(cases)]
+
+
+def heldout_repair_cases():
+    """Diagnostic projects, never returned by repair_case or used for selection.
+
+    The worker sees the contract and visible tests, but not expression/expected.
+    These are fixed local fixtures, not a hidden external benchmark.
+    """
+    return [
+        {'name': 'csv_quoting', 'failure': 'read_names splits quoted commas and retains blank rows',
+         'files': {'solution.py': 'def read_names(text):\n    return [line.split(",")[0] for line in text.splitlines()[1:]]\n',
+                   'test_solution.py': 'from solution import read_names\nassert read_names("name,age\\nAlice,20") == ["Alice"]\n'},
+         'mutable': ['solution.py'],
+         'goal': 'Repair solution.py read_names(text). Parse CSV using its first row as a header; return the name column in order. Support quoted commas, escaped quotes and embedded newlines. Skip empty rows. Empty input or header-only input returns []. Preserve test_solution.py.',
+         'imports': 'from solution import read_names',
+         'expression': '[read_names(v) for v in ' + repr(['', 'name,age\n', 'name,age\n"Doe, Jane",20\n\nBob,30',
+                             'age,name\n10,"A""B"', 'name,age\n"Line\nBreak",20']) + ']',
+         'expected': [[], [], ['Doe, Jane', 'Bob'], ['A"B'], ['Line\nBreak']]},
+        {'name': 'interval_merge', 'failure': 'merge combines disjoint intervals and fails empty input',
+         'files': {'solution.py': 'def merge(intervals):\n    return [[min(a for a,b in intervals), max(b for a,b in intervals)]]\n',
+                   'test_solution.py': 'from solution import merge\nassert merge([[1,3],[2,4]]) == [[1,4]]\n'},
+         'mutable': ['solution.py'],
+         'goal': 'Repair solution.py merge(intervals). Return sorted closed intervals merging overlaps and touching endpoints, preserving disjoint intervals. Empty input returns []. Endpoints are numbers with start <= end. Do not mutate the input or its nested lists. Preserve test_solution.py.',
+         'imports': 'from solution import merge',
+         'setup': 'values = [[3,4],[1,3]]; before = [row[:] for row in values]; merged = merge(values)',
+         'expression': '[merge([]), merge([[4,5],[1,2]]), merge([[5,5],[-3,0],[0,2]]), merge([[0.5,2],[1,3]]), values == before]',
+         'expected': [[], [[1, 2], [4, 5]], [[-3, 2], [5, 5]], [[0.5, 3]], True]},
+    ]
+
+
+def answers_equal(actual, expected):
+    """Numeric equivalence without treating booleans as numbers, even nested."""
+    if isinstance(expected, list):
+        return (isinstance(actual, list) and len(actual) == len(expected)
+                and all(answers_equal(a, b) for a, b in zip(actual, expected)))
+    return ((type(actual) is type(expected) or
+             type(actual) in (int, float) and type(expected) in (int, float))
+            and actual == expected)

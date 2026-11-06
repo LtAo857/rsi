@@ -4,6 +4,7 @@ Tool restrictions protect the data interface, not the host from hostile Python.
 """
 
 import csv
+from decimal import Decimal, DecimalException
 import hashlib
 import json
 from pathlib import Path
@@ -148,12 +149,15 @@ class Toolbox:
 class PaginatedToolbox(Toolbox):
     """A deliberately restricted CSV-only task environment; no SQL/file bypass."""
     help = {'list_files':TOOL_HELP['list_files'],
-            'read_csv':'args {path, offset=0, limit=20}: read at most 20 CSV records; next_offset/null marks continuation'}
+            'read_csv':'args {path, offset=0, limit=20}: read at most 20 CSV records; next_offset/null marks continuation',
+            'aggregate':'args {path, operation: count|sum, field: column for sum, where: {column: exact_value}}: aggregate already observed records, requires all pages read'}
 
     def __init__(self, data_dir):
         self.root = Path(data_dir).resolve(strict=True)
         if not self.root.is_dir():
             raise ValueError('data_dir must be a directory')
+        self.observed = {}
+        self.ends = {}
 
     def close(self):
         pass
@@ -168,6 +172,43 @@ class PaginatedToolbox(Toolbox):
                 self.page(args,20,20)
             except ValueError as error:
                 return {'error':str(error)}
+            result = super().call(name,args)
+            if 'rows' in result:
+                path = str(self.path(args.get('path')))
+                offset = args.get('offset',0)
+                observed = self.observed.setdefault(path,{})
+                observed.update({offset+i:row for i,row in enumerate(result['rows'])})
+                if result['next_offset'] is None:
+                    self.ends[path] = offset+len(result['rows'])
+            return result
+        if name == 'aggregate':
+            try:
+                if not isinstance(args,dict) or args.get('operation') not in ('sum','count'):
+                    raise ValueError('aggregate requires operation sum or count')
+                path = str(self.path(args.get('path')))
+                observed, end = self.observed.get(path,{}), self.ends.get(path)
+                if end is None or len(observed)!=end or any(not 0<=i<end for i in observed):
+                    raise ValueError('Read all pages before aggregate; some records have not been observed.')
+                where = args.get('where',{})
+                if not isinstance(where,dict) or len(where)>10:
+                    raise ValueError('where must be an object with at most 10 columns')
+                rows = list(observed.values())
+                columns = set(rows[0]) if rows else set()
+                if not set(where).issubset(columns):
+                    raise ValueError('unknown filter column')
+                selected = [row for row in rows if all(row[k]==str(v) for k,v in where.items())]
+                value = len(selected)
+                if args['operation']=='sum':
+                    field = args.get('field')
+                    if field not in columns:
+                        raise ValueError('sum requires a known numeric field')
+                    numbers = [Decimal(row[field]) for row in selected]
+                    if not all(number.is_finite() for number in numbers):
+                        raise ValueError('sum values must be finite')
+                    value = str(sum(numbers,Decimal(0)))
+                return {'value':value,'rows_observed':end,'rows_matched':len(selected),'complete':True}
+            except (ValueError,TypeError,OSError,DecimalException) as error:
+                return {'error':str(error)[:500]}
         return super().call(name,args)
 
 

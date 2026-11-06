@@ -1,6 +1,7 @@
 """Fresh interpreter boundary: load exactly one selected generation.
 
-This is process isolation, not a hostile-code security sandbox.
+This worker alone provides process isolation. The supervisor can additionally
+launch it inside the optional macOS host sandbox.
 """
 
 import contextlib

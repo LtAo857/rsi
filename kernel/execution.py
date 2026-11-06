@@ -15,7 +15,7 @@ class CallLimit(RuntimeError):
         self.stdout, self.stderr = stdout, stderr
 
 
-def run_bounded(command, prompt, cwd, timeout, max_output_bytes=None, max_tokens=None):
+def run_bounded(command, prompt, cwd, timeout, max_output_bytes=None, max_tokens=None, env=None):
     """POSIX process-group cleanup. Token limits act on reported usage, not billing."""
     buffers = {'stdout': bytearray(), 'stderr': bytearray()}
     partial = bytearray()
@@ -25,7 +25,7 @@ def run_bounded(command, prompt, cwd, timeout, max_output_bytes=None, max_tokens
         input_file.write(prompt.encode())
         input_file.seek(0)
         process = subprocess.Popen(command, stdin=input_file, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, cwd=cwd, start_new_session=True)
+                                   stderr=subprocess.PIPE, cwd=cwd, start_new_session=True, env=env)
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ, 'stdout')

@@ -33,7 +33,7 @@ class PaginationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             item = make_pagination_tasks(Path(directory),123)[0]
             tools = PaginatedToolbox(item['directory'])
-            self.assertEqual(set(tools.help),{'list_files','read_csv'})
+            self.assertEqual(set(tools.help),{'list_files','read_csv','aggregate'})
             for tool in ('sql','schema','read_file'):
                 self.assertIn('error',tools.call(tool,{}))
             self.assertIn('error',tools.call('read_csv',{'path':'records.csv','limit':100}))
@@ -42,6 +42,20 @@ class PaginationTests(unittest.TestCase):
             page = tools.call('read_csv',{'path':'records.csv'})
             self.assertEqual(len(page['rows']),20)
             self.assertEqual(page['next_offset'],20)
+            self.assertIn('error',tools.call('aggregate',{'path':'records.csv','operation':'sum','field':'qty','where':{'status':'active'}}))
+            collected = list(page['rows'])
+            offset = page['next_offset']
+            while offset is not None:
+                next_page = tools.call('read_csv',{'path':'records.csv','offset':offset})
+                collected.extend(next_page['rows'])
+                offset = next_page['next_offset']
+            aggregate = tools.call('aggregate',{'path':'records.csv','operation':'sum','field':'qty','where':{'status':'active'}})
+            self.assertEqual(int(aggregate['value']),sum(int(row['qty']) for row in collected if row['status']=='active'))
+            self.assertTrue(aggregate['complete'])
+            self.assertIn('error',tools.call('aggregate',{'path':'records.csv','operation':'sum','field':'missing'}))
+            # A huge valid offset must not allocate a correspondingly huge set.
+            tools.call('read_csv',{'path':'records.csv','offset':10**30})
+            self.assertIn('error',tools.call('aggregate',{'path':'records.csv','operation':'count'}))
             context = []
             run_session('test',tools,lambda task: context.append(task) or {'answer':0})
             self.assertEqual(set(context[0]['tools']),set(tools.help))

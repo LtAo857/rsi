@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import re
+from .search import confirmed_gain
 
 
 def validate_specs(specs):
@@ -38,3 +39,12 @@ def usage_delta(before, after):
     return {'calls':after.get('calls',0)-before.get('calls',0),
             'tokens':(after.get('tokens',0)-before.get('tokens',0)
                       if after.get('unknown_tokens',0) == before.get('unknown_tokens',0) else None)}
+
+
+def assess_pairs(pairs):
+    if len(pairs)<2 or any(pair['regressed'] for pair in pairs):
+        return False
+    return confirmed_gain([[p['ablated']['score']]*2 for p in pairs],
+                          [[p['baseline']['score']]*2 for p in pairs],.01,
+                          candidate_costs=[p['ablated']['tokens'] for p in pairs],
+                          baseline_costs=[p['baseline']['tokens'] for p in pairs])

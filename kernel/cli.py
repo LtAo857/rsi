@@ -19,12 +19,13 @@ def main():
     ablate = sub.add_parser('ablate', help='在独立副本中逐机制消融，仅生成诊断报告')
     ablate.add_argument('specs', help='name/path/before/after 对象组成的 JSON 数组')
     ablate.add_argument('--seeds', type=int, default=2)
+    ablate.add_argument('--confirm-seeds', type=int, default=0, help='达到初评门槛后，用新输入再次配对确认；默认不运行')
     ablate.add_argument('--seed', type=int, default=982451653)
     ablate.add_argument('--timeout', type=int, default=120)
     for name in ('max-calls','max-tokens','max-call-tokens','max-prompt-chars','max-output-bytes'):
         ablate.add_argument('--'+name, type=int)
     ablate.add_argument('--max-cost', type=float)
-    sub.add_parser("init", help="创建初始版本")
+    initialize = sub.add_parser("init", help="创建初始版本")
     run = sub.add_parser("run", help="自动运行自我改进循环")
     run.add_argument("--rounds", type=int, default=2)
     run.add_argument("--timeout", type=int, default=900)
@@ -81,6 +82,9 @@ def main():
         command_parser.add_argument('--api-key-env', help='存放 API 密钥的环境变量名')
         command_parser.add_argument('--task-output-tokens', type=int, help='DeepSeek 每个任务动作的服务端输出 token 上限')
         command_parser.add_argument('--task-thinking', choices=['enabled', 'disabled'], help='DeepSeek 任务模型思考模式')
+    for command_parser in (run,evaluate):
+        command_parser.add_argument('--analysis-backend', choices=['deepseek','codex'], help='可选独立失败分析模型；假设不作为评分真值')
+        command_parser.add_argument('--analysis-model', default='')
     sub.add_parser("status", help="查看版本与改进历史")
     sub.add_parser("heldout", help="最终留出集验证，不参与版本选择")
     validate = sub.add_parser('validate', help='在多个新种子上比较初始与当前版本，不参与搜索')
@@ -101,6 +105,8 @@ def main():
     policy.add_argument('--max-cost', type=float)
     sub.add_parser("stop", help="当前轮完成后停止")
     sub.add_parser("resume", help="清除停止标记")
+    for command_parser in (run,solve,evaluate,policy,ablate,initialize):
+        command_parser.add_argument('--host-sandbox', choices=['none','macos'], help='macOS 候选 Python 隔离，配置随状态锁定；仅允许固定 DeepSeek 网络适配器')
     args = parser.parse_args()
     if args.action == 'diagnose':
         from .diagnostics import diagnose_evaluation
@@ -146,6 +152,11 @@ def main():
         settings = {name: getattr(args, name) for name in (
             'max_calls', 'max_tokens', 'max_cost', 'max_call_tokens', 'max_prompt_chars', 'max_output_bytes')}
     task_command = None
+    if getattr(args,'analysis_backend',None):
+        settings['semantic_reviewer'] = backend_command(args.analysis_backend,'task',args.analysis_model,
+            args.base_url,args.api_key_env,getattr(args,'timeout',300),codex_isolated=args.codex_isolated,
+            max_output_tokens=2048 if args.analysis_backend=='deepseek' else None,
+            thinking='disabled' if args.analysis_backend=='deepseek' else None)
     if getattr(args, 'task_backend', None):
         task_command = backend_command(args.task_backend, 'task', args.task_model,
                                        args.base_url, args.api_key_env, getattr(args, 'timeout', 300), codex_isolated=args.codex_isolated,
@@ -153,7 +164,8 @@ def main():
     try:
         engine = Engine(args.state, command, getattr(args, "timeout", 300), task_command=task_command,
                         benchmark=getattr(args, 'benchmark', None),
-                        datadesk_size=getattr(args, 'datadesk_size', None), **settings)
+                        datadesk_size=getattr(args, 'datadesk_size', None),
+                        host_sandbox=getattr(args,'host_sandbox',None), **settings)
     except ValueError as error:
         parser.error(str(error))
     if args.action == "run":
@@ -182,7 +194,7 @@ def main():
         elif args.action == 'validate-policy':
             result = engine.validate_policy()
         elif args.action == 'ablate':
-            result = engine.ablate(json.loads(Path(args.specs).read_text()), args.seeds, args.seed)
+            result = engine.ablate(json.loads(Path(args.specs).read_text()), args.seeds, args.seed,args.confirm_seeds)
         elif args.action == 'evaluate':
             result = {'active':state['active'], 'evaluation':engine.score(
                 engine.version(state['active']), args.seed, heldout=args.split == 'heldout')}

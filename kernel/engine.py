@@ -27,8 +27,10 @@ from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
 from .datadesk import PaginatedToolbox, Toolbox, check_answer, run_session
 from .pagination_tasks import make_pagination_tasks
 from .datadesk_tasks import EVOLVE, HELDOUT_ONLY, make_split
-from .diagnostics import diagnose_evaluation
-from .ablation import apply_spec, usage_delta, validate_specs
+from .diagnostics import compact_evidence, diagnose_evaluation, task_failure_evidence
+from .ablation import apply_spec, assess_pairs, usage_delta, validate_specs
+from .isolation import clean_environment, limited_python, sandbox_command, trusted_adapter
+from .semantic import review_messages, validate_review
 
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("worker.py")
@@ -56,7 +58,7 @@ def identity(root):
 
 
 class Engine:
-    def __init__(self, state_dir, command=None, timeout=300, task_command=None, benchmark=None, datadesk_size=None, **settings):
+    def __init__(self, state_dir, command=None, timeout=300, task_command=None, benchmark=None, datadesk_size=None, host_sandbox=None, **settings):
         self.root = Path(state_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.versions = self.root / "versions"
@@ -67,6 +69,20 @@ class Engine:
         self.search = SearchSettings(**settings)
         runtime_path = self.root / 'runtime.json'
         saved = json.loads(runtime_path.read_text()) if runtime_path.exists() else None
+        saved_sandbox = saved.get('host_sandbox','none') if saved else 'none'
+        self.host_sandbox = host_sandbox or saved_sandbox
+        if self.host_sandbox not in ('none','macos'):
+            raise ValueError('unknown host sandbox')
+        if (saved or self.state_path.exists()) and self.host_sandbox != saved_sandbox:
+            raise ValueError('sandbox configuration changed; use a new state directory')
+        if self.host_sandbox == 'macos':
+            probe = subprocess.run(sandbox_command([sys.executable,'-I','-B','-c','print("ready")']),
+                                   capture_output=True,text=True,timeout=10,env=clean_environment())
+            if probe.returncode or probe.stdout.strip() != 'ready':
+                raise ValueError('sandbox probe failed; refusing unsandboxed execution')
+            for adapter in (command,task_command,settings.get('reviewer'),settings.get('semantic_reviewer')):
+                if adapter:
+                    trusted_adapter(adapter,SOURCE)
         saved_benchmark = saved.get('benchmark', 'basic') if saved else 'basic'
         self.benchmark = benchmark or saved_benchmark
         if self.benchmark not in ('basic', 'advanced', 'datadesk'):
@@ -125,18 +141,23 @@ class Engine:
             messages = self.call(root, 'messages', task=arguments['task'])
             arguments['model_response'] = self.model_response(root, messages)
         before = identity(root)
-        process = subprocess.run(
-            [sys.executable, "-I", "-B", str(WORKER)],
-            input=json.dumps({"root": str(root), "op": op, **arguments}),
-            text=True, capture_output=True, cwd=root, timeout=min(self.timeout, 30))
+        request = json.dumps({"root": str(root), "op": op, **arguments})
+        if self.host_sandbox == 'macos':
+            with tempfile.TemporaryDirectory(prefix='rsi-worker-') as scratch:
+                program = limited_python('import runpy; runpy.run_path('+repr(str(WORKER))+',run_name="__main__")')
+                command = sandbox_command([sys.executable,'-I','-B','-c',program],readable=[root,WORKER],writable=[scratch])
+                process = run_bounded(command,request,root,min(self.timeout,30),1048576,env=clean_environment())
+        else:
+            process = subprocess.run([sys.executable,'-I','-B',str(WORKER)],input=request,
+                                     text=True,capture_output=True,cwd=root,timeout=min(self.timeout,30))
         if identity(root) != before:
             raise RuntimeError("generation modified its source during execution")
         if process.returncode:
             raise RuntimeError(process.stderr[-2000:])
         return json.loads(process.stdout)["result"]
 
-    def model_response(self, root, messages):
-        if not self.task_command:
+    def model_response(self, root, messages, command=None):
+        if not (self.task_command or command):
             raise ModelUnavailable('DataDesk requires a task model backend')
         if (not isinstance(messages, dict) or set(messages) != {'system', 'prompt'} or
                 any(not isinstance(value, str) for value in messages.values())):
@@ -148,7 +169,7 @@ class Engine:
         fingerprint = identity(root)
         try:
             output = self.code(root, json.dumps(messages, ensure_ascii=False),
-                               logs / (uuid.uuid4().hex + '.log'), command=self.task_command)
+                               logs / (uuid.uuid4().hex + '.log'), command=command or self.task_command)
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
             raise ModelUnavailable('model unavailable: ' + str(error)) from error
         if identity(root) != fingerprint:
@@ -223,13 +244,21 @@ class Engine:
         return version_id
 
     def initialize(self):
-        if self.task_command or self.benchmark != 'basic':
+        existing_runtime = self.root / 'runtime.json'
+        if existing_runtime.exists():
+            saved = json.loads(existing_runtime.read_text())
+            if (saved.get('task_command') != self.task_command or
+                    saved.get('benchmark','basic') != self.benchmark or
+                    saved.get('datadesk_size','compact') != self.datadesk_size or
+                    saved.get('host_sandbox','none') != self.host_sandbox):
+                raise ValueError('runtime configuration changed before initialization; use a new state directory')
+        if self.task_command or self.benchmark != 'basic' or self.host_sandbox != 'none':
             runtime = self.root / 'runtime.json'
             if runtime.exists() and json.loads(runtime.read_text())['task_command'] != self.task_command:
                 raise ValueError('task model configuration changed; use a new state directory')
             if not runtime.exists():
                 atomic_json(runtime, {'task_command':self.task_command, 'benchmark':self.benchmark,
-                                      'datadesk_size':self.datadesk_size})
+                                      'datadesk_size':self.datadesk_size,'host_sandbox':self.host_sandbox})
         if self.state_path.exists():
             return self.state()
         with tempfile.TemporaryDirectory(prefix="rsi-seed-") as directory:
@@ -344,6 +373,10 @@ class Engine:
         command = command or self.command
         if not command:
             raise RuntimeError("a coding command is required; use --coder or --demo")
+        if self.host_sandbox == 'macos':
+            trusted_adapter(command,SOURCE)
+            # Network-enabled adapters must not import candidate/user PYTHONPATH.
+            command = [command[0],'-I',*command[1:]]
         if self.search.max_prompt_chars is not None and len(prompt) > self.search.max_prompt_chars:
             raise RuntimeError('call prompt character limit exceeded before launch')
         usage_path = self.root / "usage.json"
@@ -435,12 +468,14 @@ class Engine:
             if self.search.cache_baseline and label == 'base-meta':
                 # Initial baseline only: confirmation and candidate trials stay fresh.
                 # Hash the environment, never write its credential values to disk.
-                context = [identity(root), self.benchmark, self.datadesk_size, seed + i, self.command,
+                context = [identity(root), self.benchmark, self.datadesk_size, self.host_sandbox,
+                           self.search.semantic_reviewer, seed + i, self.command,
                            self.task_command, self.timeout, sys.version,
                            sorted(os.environ.items()),
                            [(name, hashlib.sha256((SOURCE / 'kernel' / name).read_bytes()).hexdigest())
                             for name in ('engine.py', 'evaluation.py', 'worker.py', 'backends.py', 'search.py',
-                                         'datadesk.py', 'datadesk_tasks.py', 'diagnostics.py', 'pagination_tasks.py')]]
+                                         'datadesk.py', 'datadesk_tasks.py', 'diagnostics.py', 'pagination_tasks.py',
+                                         'semantic.py','isolation.py','execution.py')]]
                 key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
                 cache = self.root / 'baseline-cache' / (key + '.json')
                 if cache.exists():
@@ -529,9 +564,9 @@ class Engine:
                     raise
                 except Exception as error:
                     rows.append({'task':task, 'ok':False, 'error':str(error)[-1000:]})
-            return diagnose_evaluation({'score':sum(row['ok'] for row in rows) / len(rows), 'traces':rows,
+            return self.semantic_review(root,diagnose_evaluation({'score':sum(row['ok'] for row in rows) / len(rows), 'traces':rows,
                     'split':'heldout' if heldout else 'search', 'seed':seed, 'families':families,
-                    'size':self.datadesk_size})
+                    'size':self.datadesk_size}))
 
     def score_pagination(self, root, seed, heldout=False):
         # Same task families in both splits, disjoint data by fixed seed offset.
@@ -549,10 +584,22 @@ class Engine:
                     raise
                 except Exception as error:
                     rows.append({'task':task,'ok':False,'error':str(error)[-1000:]})
-        return diagnose_evaluation({'score':sum(row['ok'] for row in rows)/len(rows),'traces':rows,
+        return self.semantic_review(root,diagnose_evaluation({'score':sum(row['ok'] for row in rows)/len(rows),'traces':rows,
                                    'size':'pagination','split':'heldout' if heldout else 'search',
                                    'seed':seed,'data_seed':data_seed,
-                                   'scope':'CSV-only interface; heldout uses new data in the same two families'})
+                                   'scope':'CSV-only interface; heldout uses new data in the same two families'}))
+
+    def semantic_review(self, root, evaluation):
+        if self.search.semantic_reviewer:
+            for trace in evaluation['traces']:
+                if trace['ok']:
+                    continue
+                text = self.model_response(root,review_messages(trace),command=self.search.semantic_reviewer)
+                try:
+                    trace['semantic_review'] = validate_review(text,trace)
+                except ValueError:
+                    trace['semantic_review'] = {'error':'invalid reviewer response; no hypothesis accepted'}
+        return evaluation
 
     def meta_probe(self, root, audit, label, case_index=0):
         # Exercise the generation's own policy on a separate code-repair task.
@@ -583,8 +630,13 @@ class Engine:
             # Fresh supervisor-only test values, including negatives and floats.
             program = ('import json\n' + case['imports'] + '\n' + case.get('setup', '') +
                        '\nprint(json.dumps(' + case['expression'] + '))')
-            result = subprocess.run([sys.executable, "-B", "-c", program], cwd=workspace,
-                                    capture_output=True, text=True, timeout=30)
+            if self.host_sandbox == 'macos':
+                command = sandbox_command([sys.executable,'-I','-B','-c',limited_python(
+                    'import sys; sys.path.insert(0,'+repr(str(workspace))+');\n'+program)],readable=[workspace])
+                result = run_bounded(command,'',workspace,30,1048576,env=clean_environment())
+            else:
+                result = subprocess.run([sys.executable,'-B','-c',program],cwd=workspace,
+                                        capture_output=True,text=True,timeout=30)
             if result.returncode:
                 return 0.0
             try:
@@ -611,12 +663,12 @@ class Engine:
         old_trials = self.trials(current, audit, "base-meta", number + 10)
         old = json.loads((audit / 'base-meta-0.tasks.json').read_text())
         old_meta = sum(row[1] for row in old_trials) / len(old_trials)
-        evidence = {"task_evaluation": old, "improvement_score": old_meta,
+        base_evaluations = [json.loads((audit / f'base-meta-{i}.tasks.json').read_text())
+                            for i in range(len(old_trials))]
+        evidence = {"task_evaluation": compact_evidence(old), "improvement_score": old_meta,
+                    'trial_evaluation_summaries':[{'trial':i,'score':value['score']} for i,value in enumerate(base_evaluations)],
                     **self.search_evidence()}
-        failures = []
-        for index, row in enumerate(old["traces"]):
-            if not row["ok"]:
-                failures.append({"id": f"task-{index}", "kind": "task_failure", "trace": row})
+        failures = task_failure_evidence(base_evaluations)
         if old_meta < 1:
             failures.append({"id": "policy-repair", "kind": "repair_failure", "score": old_meta})
         for trace_path in sorted(audit.glob("base-meta-*.trace.json")):
@@ -640,6 +692,9 @@ class Engine:
             goal += " Preserve build_messages(task) returning system/prompt strings and solve(task, llm=None)."
             if self.benchmark == 'datadesk':
                 goal += " Preserve parse_action(text). DataDesk runs up to 10 actions: JSON {tool,args} or {answer}. build_messages receives question, tool descriptions and full action/result history. Tools and scoring are fixed."
+                from .datadesk import TOOL_HELP
+                goal += ' Available tool contracts for this profile: '+json.dumps(
+                    PaginatedToolbox.help if self.datadesk_size=='pagination' else TOOL_HELP)
             else:
                 goal += " The task runtime supports one stateless model call per task."
         prompt = self.call(current, "plan", evidence=evidence, goal=goal)
@@ -870,11 +925,13 @@ class Engine:
         atomic_json(self.root / 'policy-validation.json', result)
         return result
 
-    def ablate(self, specs, seeds=2, seed=982451653):
+    def ablate(self, specs, seeds=2, seed=982451653, confirm_seeds=0):
         """Paired task-only diagnostics. Caller holds the lock; never publishes."""
         validate_specs(specs)
         if type(seeds) is not int or not 1 <= seeds <= 5 or type(seed) is not int:
             raise ValueError('ablation requires 1 to 5 seeds and an integer initial seed')
+        if type(confirm_seeds) is not int or confirm_seeds not in (0,2,3,4,5):
+            raise ValueError('confirmation requires 0 or 2 to 5 seeds')
         state = self.recover(self.state())
         current = self.version(state['active'])
         audit = self.root / 'ablations' / uuid.uuid4().hex
@@ -900,9 +957,13 @@ class Engine:
                 for index, (spec, candidate) in enumerate(zip(specs, variants)):
                     variant = {'name':spec['name'], 'version':identity(candidate), 'trials':[]}
                     report['variants'].append(variant)
-                    for trial in range(seeds):
-                        pair = {'seed':seed+trial}
-                        variant['trials'].append(pair)
+                    for trial in range(seeds+confirm_seeds):
+                        confirming = trial>=seeds
+                        if confirming and not assess_pairs(variant['trials']):
+                            break
+                        trial_seed = seed+trial if not confirming else seed+10000+trial-seeds
+                        pair = {'seed':trial_seed}
+                        variant.setdefault('confirmation' if confirming else 'trials',[]).append(pair)
                         roles = [('baseline',current),('ablated',candidate)]
                         if (trial+index) % 2:
                             roles.reverse()
@@ -910,7 +971,7 @@ class Engine:
                         scores = {}
                         for role, root in roles:
                             before = usage()
-                            scores[role] = self.score(root, seed+trial)
+                            scores[role] = self.score(root, trial_seed)
                             pair[role] = {'score':scores[role]['score'], **usage_delta(before,usage())}
                             atomic_json(audit / f'{spec["name"]}-{trial}-{role}.json',scores[role])
                         a, b = scores['baseline']['traces'], scores['ablated']['traces']
@@ -919,9 +980,14 @@ class Engine:
                         pair['regressed'] = sum(x['ok'] and not y['ok'] for x,y in zip(a,b))
                         pair['improved'] = sum(not x['ok'] and y['ok'] for x,y in zip(a,b))
                         atomic_json(audit / 'result.json',report)
-                    variant['observed_regressions'] = sum(p['regressed'] for p in variant['trials'])
+                    variant['observed_regressions'] = sum(p['regressed'] for p in
+                        variant['trials']+variant.get('confirmation',[]))
                     variant['conclusion'] = ('regression_observed' if variant['observed_regressions'] else
                                              'no_regression_observed_not_proof_of_redundancy')
+                    variant['confirmed_task_benefit'] = bool(confirm_seeds and
+                        len(variant.get('confirmation',[]))==confirm_seeds and assess_pairs(variant['trials'])
+                        and assess_pairs(variant['confirmation']))
+                    variant['deletion_authorized'] = False
             report['status'] = 'complete'
             atomic_json(self.root / 'ablation.json', report)
         except Exception as error:

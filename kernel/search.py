@@ -36,6 +36,7 @@ class SearchSettings:
     max_call_tokens: int | None = None
     max_prompt_chars: int | None = None
     max_output_bytes: int | None = None
+    semantic_reviewer: list | None = None
 
     def __post_init__(self):
         for name in ('trials', 'edit_budget', 'min_edit_budget', 'stagnation', 'prune_every'):

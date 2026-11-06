@@ -16,6 +16,14 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
     diagnose = sub.add_parser('diagnose', help='离线诊断已有任务报告，不调用模型、不写搜索历史')
     diagnose.add_argument('report', help='evaluation.json 或 trial tasks.json')
+    ablate = sub.add_parser('ablate', help='在独立副本中逐机制消融，仅生成诊断报告')
+    ablate.add_argument('specs', help='name/path/before/after 对象组成的 JSON 数组')
+    ablate.add_argument('--seeds', type=int, default=2)
+    ablate.add_argument('--seed', type=int, default=982451653)
+    ablate.add_argument('--timeout', type=int, default=120)
+    for name in ('max-calls','max-tokens','max-call-tokens','max-prompt-chars','max-output-bytes'):
+        ablate.add_argument('--'+name, type=int)
+    ablate.add_argument('--max-cost', type=float)
     sub.add_parser("init", help="创建初始版本")
     run = sub.add_parser("run", help="自动运行自我改进循环")
     run.add_argument("--rounds", type=int, default=2)
@@ -103,7 +111,7 @@ def main():
             parser.error(str(error))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
-    if args.action == 'evaluate' and not 1 <= args.timeout <= 7200:
+    if args.action in ('evaluate', 'ablate') and not 1 <= args.timeout <= 7200:
         parser.error('timeout 必须为 1–7200 秒')
     command = None
     if args.action in ('run', 'validate-policy'):
@@ -134,7 +142,7 @@ def main():
                                 shlex.split(args.reviewer) if args.reviewer else None)
     if args.action == 'solve':
         settings = {name: getattr(args, name) for name in ('max_calls', 'max_tokens', 'max_cost')}
-    if args.action in ('validate-policy', 'evaluate'):
+    if args.action in ('validate-policy', 'evaluate', 'ablate'):
         settings = {name: getattr(args, name) for name in (
             'max_calls', 'max_tokens', 'max_cost', 'max_call_tokens', 'max_prompt_chars', 'max_output_bytes')}
     task_command = None
@@ -173,6 +181,8 @@ def main():
             result = engine.validate_versions(args.seeds)
         elif args.action == 'validate-policy':
             result = engine.validate_policy()
+        elif args.action == 'ablate':
+            result = engine.ablate(json.loads(Path(args.specs).read_text()), args.seeds, args.seed)
         elif args.action == 'evaluate':
             result = {'active':state['active'], 'evaluation':engine.score(
                 engine.version(state['active']), args.seed, heldout=args.split == 'heldout')}

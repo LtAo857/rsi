@@ -27,6 +27,7 @@ from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
 from .datadesk import Toolbox, check_answer, run_session
 from .datadesk_tasks import EVOLVE, HELDOUT_ONLY, make_split
 from .diagnostics import diagnose_evaluation
+from .ablation import apply_spec, usage_delta, validate_specs
 
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("worker.py")
@@ -844,3 +845,64 @@ class Engine:
         atomic_json(audit / 'result.json', result)
         atomic_json(self.root / 'policy-validation.json', result)
         return result
+
+    def ablate(self, specs, seeds=2, seed=982451653):
+        """Paired task-only diagnostics. Caller holds the lock; never publishes."""
+        validate_specs(specs)
+        if type(seeds) is not int or not 1 <= seeds <= 5 or type(seed) is not int:
+            raise ValueError('ablation requires 1 to 5 seeds and an integer initial seed')
+        state = self.recover(self.state())
+        current = self.version(state['active'])
+        audit = self.root / 'ablations' / uuid.uuid4().hex
+        audit.mkdir(parents=True)
+        report = {'active':state['active'], 'benchmark':self.benchmark, 'status':'running',
+                  'specs':specs, 'variants':[], 'audit':str(audit),
+                  'scope':'paired task scores only; not repair-policy evaluation, semantic proof or automatic deletion'}
+        def usage():
+            path = self.root / 'usage.json'
+            return json.loads(path.read_text()) if path.exists() else {}
+        try:
+            with tempfile.TemporaryDirectory(prefix='rsi-ablation-') as directory:
+                variants = []
+                # Prepare and check all variants before any potentially paid call.
+                for spec in specs:
+                    candidate = Path(directory) / spec['name']
+                    shutil.copytree(current, candidate)
+                    apply_spec(candidate, spec)
+                    self.validate_tree(candidate)
+                    self.health(candidate)
+                    variants.append(candidate)
+                    shutil.copytree(candidate, audit / spec['name'])
+                for index, (spec, candidate) in enumerate(zip(specs, variants)):
+                    variant = {'name':spec['name'], 'version':identity(candidate), 'trials':[]}
+                    report['variants'].append(variant)
+                    for trial in range(seeds):
+                        pair = {'seed':seed+trial}
+                        variant['trials'].append(pair)
+                        roles = [('baseline',current),('ablated',candidate)]
+                        if (trial+index) % 2:
+                            roles.reverse()
+                        pair['order'] = [role for role, _ in roles]
+                        scores = {}
+                        for role, root in roles:
+                            before = usage()
+                            scores[role] = self.score(root, seed+trial)
+                            pair[role] = {'score':scores[role]['score'], **usage_delta(before,usage())}
+                            atomic_json(audit / f'{spec["name"]}-{trial}-{role}.json',scores[role])
+                        a, b = scores['baseline']['traces'], scores['ablated']['traces']
+                        if len(a) != len(b) or any(x['task'] != y['task'] for x,y in zip(a,b)):
+                            raise ValueError('ablation task pairing mismatch')
+                        pair['regressed'] = sum(x['ok'] and not y['ok'] for x,y in zip(a,b))
+                        pair['improved'] = sum(not x['ok'] and y['ok'] for x,y in zip(a,b))
+                        atomic_json(audit / 'result.json',report)
+                    variant['observed_regressions'] = sum(p['regressed'] for p in variant['trials'])
+                    variant['conclusion'] = ('regression_observed' if variant['observed_regressions'] else
+                                             'no_regression_observed_not_proof_of_redundancy')
+            report['status'] = 'complete'
+            atomic_json(self.root / 'ablation.json', report)
+        except Exception as error:
+            report.update(status='failed', error=type(error).__name__)
+            raise
+        finally:
+            atomic_json(audit / 'result.json',report)
+        return report

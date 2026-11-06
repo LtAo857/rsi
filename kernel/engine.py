@@ -26,6 +26,7 @@ from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace
 from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
 from .datadesk import Toolbox, check_answer, run_session
 from .datadesk_tasks import EVOLVE, HELDOUT_ONLY, make_split
+from .diagnostics import diagnose_evaluation
 
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("worker.py")
@@ -437,7 +438,7 @@ class Engine:
                            sorted(os.environ.items()),
                            [(name, hashlib.sha256((SOURCE / 'kernel' / name).read_bytes()).hexdigest())
                             for name in ('engine.py', 'evaluation.py', 'worker.py', 'backends.py', 'search.py',
-                                         'datadesk.py', 'datadesk_tasks.py')]]
+                                         'datadesk.py', 'datadesk_tasks.py', 'diagnostics.py')]]
                 key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
                 cache = self.root / 'baseline-cache' / (key + '.json')
                 if cache.exists():
@@ -524,9 +525,9 @@ class Engine:
                     raise
                 except Exception as error:
                     rows.append({'task':task, 'ok':False, 'error':str(error)[-1000:]})
-            return {'score':sum(row['ok'] for row in rows) / len(rows), 'traces':rows,
+            return diagnose_evaluation({'score':sum(row['ok'] for row in rows) / len(rows), 'traces':rows,
                     'split':'heldout' if heldout else 'search', 'seed':seed, 'families':families,
-                    'size':self.datadesk_size}
+                    'size':self.datadesk_size})
 
     def meta_probe(self, root, audit, label, case_index=0):
         # Exercise the generation's own policy on a separate code-repair task.

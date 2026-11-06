@@ -14,6 +14,8 @@ def main():
     parser = argparse.ArgumentParser(description="RSI：执行与改进策略共同版本化")
     parser.add_argument("--state", default=str(SOURCE / ".rsi"), help="状态目录")
     sub = parser.add_subparsers(dest="action", required=True)
+    diagnose = sub.add_parser('diagnose', help='离线诊断已有任务报告，不调用模型、不写搜索历史')
+    diagnose.add_argument('report', help='evaluation.json 或 trial tasks.json')
     sub.add_parser("init", help="创建初始版本")
     run = sub.add_parser("run", help="自动运行自我改进循环")
     run.add_argument("--rounds", type=int, default=2)
@@ -92,6 +94,15 @@ def main():
     sub.add_parser("stop", help="当前轮完成后停止")
     sub.add_parser("resume", help="清除停止标记")
     args = parser.parse_args()
+    if args.action == 'diagnose':
+        from .diagnostics import diagnose_evaluation
+        try:
+            report = json.loads(Path(args.report).read_text())
+            result = diagnose_evaluation(report.get('evaluation', report))
+        except (OSError, ValueError, AttributeError) as error:
+            parser.error(str(error))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.action == 'evaluate' and not 1 <= args.timeout <= 7200:
         parser.error('timeout 必须为 1–7200 秒')
     command = None

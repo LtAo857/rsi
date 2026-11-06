@@ -145,11 +145,37 @@ class Toolbox:
             return {'error': str(error)[:500]}
 
 
+class PaginatedToolbox(Toolbox):
+    """A deliberately restricted CSV-only task environment; no SQL/file bypass."""
+    help = {'list_files':TOOL_HELP['list_files'],
+            'read_csv':'args {path, offset=0, limit=20}: read at most 20 CSV records; next_offset/null marks continuation'}
+
+    def __init__(self, data_dir):
+        self.root = Path(data_dir).resolve(strict=True)
+        if not self.root.is_dir():
+            raise ValueError('data_dir must be a directory')
+
+    def close(self):
+        pass
+
+    def call(self, name, args):
+        if name not in self.help:
+            return {'error':'Tool unavailable in this CSV-only task environment.'}
+        if name == 'read_csv':
+            try:
+                if not isinstance(args, dict):
+                    raise ValueError('args must be an object')
+                self.page(args,20,20)
+            except ValueError as error:
+                return {'error':str(error)}
+        return super().call(name,args)
+
+
 def run_session(question, toolbox, choose, max_steps=10, max_context_chars=60000):
     """Each choose invocation is one action, then tools return observations."""
     history = []
     for step in range(max_steps):
-        context = {'kind': 'datadesk', 'question': question, 'tools': TOOL_HELP, 'history': history}
+        context = {'kind': 'datadesk', 'question': question, 'tools': getattr(toolbox,'help',TOOL_HELP), 'history': history}
         if len(json.dumps(context, ensure_ascii=False)) > max_context_chars:
             return {'answer': '', 'history': history, 'stop_reason': 'context_limit', 'steps': step}
         action = choose(context)

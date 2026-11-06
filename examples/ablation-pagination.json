@@ -1,0 +1,8 @@
+[
+  {
+    "name": "no_pagination_hint",
+    "path": "agent/solver.py",
+    "before": "Read all pages needed; truncated output is incomplete. ",
+    "after": ""
+  }
+]

@@ -74,8 +74,15 @@ DataDesk 搜索集包含 5 类问题：客户城市查询、订单状态计数�
 |---|---|---|
 | `compact`，默认 | 每类 1 题，共 5 题 | 每类 1 题，共 7 题 |
 | `full` | 每类 3 题，共 15 题 | 前 5 类各 2 题、新增 2 类各 5 题，共 20 题 |
+| `pagination`，专用环境 | 活跃记录数量、数量合计，共 2 题 | 同两类问题的新数据，共 2 题 |
 
 规模随状态锁定。固定生成器按种子生成每题独立的商店数据，评分答案不传入模型提示词。配对测试使用相同种子，确认阶段使用新种子。当前覆盖 7 类合成问题，通过它们不等于具备任意数据分析能力。
+
+`pagination` 是单独的 CSV-only 分页能力测试：每题 61–79 条记录、每页最多 20 条，通常需
+读取 4 页。只提供 list_files 与 read_csv，禁用 SQL、schema 和 read_file，明确模拟只能
+通过分页接口访问数据的环境。它不改变 compact/full 的工具或成绩，需使用新状态目录。
+两类题分别要求统计活跃记录数、合计活跃记录 qty；后续页保证对答案有贡献。
+留出使用固定偏移种子生成新数据，仍是同类问题，不表示陌生任务泛化。
 
 ### CSV / SQL 多轮执行
 
@@ -111,6 +118,21 @@ python3 -m kernel --state .rsi-datadesk evaluate \
 ```
 
 使用 `--datadesk-size full` 时请初始化另一个状态目录，并按更大的任务量配置预算。`evaluate` 保存 `evaluation.json`，不写入搜索历史；该文件每次覆盖，需保留多个报告时请另行保存。
+
+分页专用评测及提示消融（以下为真实模型命令，会产生费用）：
+
+```bash
+python3 -m kernel --state .rsi-pages evaluate \
+  --benchmark datadesk --datadesk-size pagination \
+  --task-backend deepseek --task-model YOUR_TASK_MODEL \
+  --task-thinking disabled --task-output-tokens 1024 \
+  --seed 101 --max-calls 25 --max-tokens 30000
+python3 -m kernel --state .rsi-pages ablate examples/ablation-pagination.json \
+  --seeds 2 --max-calls 90 --max-tokens 100000
+```
+
+先检查轨迹是否实际出现 next_offset 及完整续页，再解读消融结果。本批仅验证离线链路，
+没有执行分页环境的真实模型评测，也未证明提醒本身对真实模型有效。
 
 ## 自动改进
 
@@ -232,6 +254,8 @@ ablation.json；中断保留部分报告和累计用量，上一份完整报告�
 - [ ] 持续多轮能力增长：真实实验已有一次升级并接管下一轮，尚无持续增长证据。
 - [ ] 语义归因与完整轨迹诊断：已增加带轨迹下标的工具错误、分页风险、终止原因和错误答案诊断，以及离线回放；尚不能判断 SQL 语义或算术根因。
 - [x] 显式逐机制消融工具：隔离副本、配对任务、多种子、用量与退步报告，已通过离线测试。
+- [x] CSV-only 分页任务：限制单页大小、禁止 SQL 绕行、独立状态与留出数据，已通过离线测试。
+- [ ] 分页环境真实模型评测与提示机制有效性验证。
 - [ ] 精确识别无用机制：已完成两个提示、两个种子的真实消融，均未退步，但成本收益不稳定，且未触发多页读取；尚不能证明可删减，剪枝仍使用净删行代理。
 - [ ] 宿主级安全沙箱。
 
@@ -246,6 +270,7 @@ ablation.json；中断保留部分报告和累计用量，上一份完整报告�
 - [轨迹诊断与离线回放](docs/experiments/2026-11-06-diagnostics.md)
 - [逐机制消融工具验证](docs/experiments/2026-11-06-ablation.md)
 - [提示机制真实模型消融](docs/experiments/2026-11-06-ablation-live.md)
+- [分页任务开发与测试](docs/experiments/2026-11-06-pagination.md)
 
 ## 开发与测试
 
@@ -255,4 +280,4 @@ python3 -m unittest discover -s tests -v
 
 测试使用离线脚本和本地模拟服务验证生命周期、模型适配、工具执行、预算、回退和评分。脚本提供的修改和答案用于验证机制，不代表自主学习或真实模型效果。
 
-最近一次全量验证：2026-11-06，111 项测试全部通过；真实模型实验与离线测试分别记录。
+最近一次全量验证：2026-11-06，116 项测试全部通过；真实模型实验与离线测试分别记录。

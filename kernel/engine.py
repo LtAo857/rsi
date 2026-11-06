@@ -24,7 +24,8 @@ from .execution import CallLimit, run_bounded
 from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace, patch_stats,
                      review_proposal, candidate_workspace)
 from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
-from .datadesk import Toolbox, check_answer, run_session
+from .datadesk import PaginatedToolbox, Toolbox, check_answer, run_session
+from .pagination_tasks import make_pagination_tasks
 from .datadesk_tasks import EVOLVE, HELDOUT_ONLY, make_split
 from .diagnostics import diagnose_evaluation
 from .ablation import apply_spec, usage_delta, validate_specs
@@ -72,7 +73,7 @@ class Engine:
             raise ValueError('unknown benchmark suite')
         saved_size = saved.get('datadesk_size', 'compact') if saved else 'compact'
         self.datadesk_size = datadesk_size or saved_size
-        if self.datadesk_size not in ('compact', 'full'):
+        if self.datadesk_size not in ('compact', 'full', 'pagination'):
             raise ValueError('unknown DataDesk size')
         if (saved or self.state_path.exists()) and self.datadesk_size != saved_size:
             raise ValueError('DataDesk size changed; use a new state directory')
@@ -167,7 +168,7 @@ class Engine:
     def datadesk_session(self, root, question, data_dir):
         if not isinstance(question, str) or not question.strip() or len(question) > 10000:
             raise ValueError('invalid DataDesk question')
-        tools = Toolbox(data_dir)
+        tools = (PaginatedToolbox if self.datadesk_size == 'pagination' else Toolbox)(data_dir)
         def choose(context):
             messages = self.call(root, 'messages', task=context)
             text = self.model_response(root, messages)
@@ -439,7 +440,7 @@ class Engine:
                            sorted(os.environ.items()),
                            [(name, hashlib.sha256((SOURCE / 'kernel' / name).read_bytes()).hexdigest())
                             for name in ('engine.py', 'evaluation.py', 'worker.py', 'backends.py', 'search.py',
-                                         'datadesk.py', 'datadesk_tasks.py', 'diagnostics.py')]]
+                                         'datadesk.py', 'datadesk_tasks.py', 'diagnostics.py', 'pagination_tasks.py')]]
                 key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
                 cache = self.root / 'baseline-cache' / (key + '.json')
                 if cache.exists():
@@ -503,6 +504,8 @@ class Engine:
     def score_datadesk(self, root, seed, heldout=False):
         if not self.task_command:
             raise ModelUnavailable('DataDesk requires a task model backend')
+        if self.datadesk_size == 'pagination':
+            return self.score_pagination(root, seed, heldout)
         with tempfile.TemporaryDirectory(prefix='rsi-datadesk-') as directory:
             directory = Path(directory)
             (directory / 'tasks').mkdir()
@@ -529,6 +532,27 @@ class Engine:
             return diagnose_evaluation({'score':sum(row['ok'] for row in rows) / len(rows), 'traces':rows,
                     'split':'heldout' if heldout else 'search', 'seed':seed, 'families':families,
                     'size':self.datadesk_size})
+
+    def score_pagination(self, root, seed, heldout=False):
+        # Same task families in both splits, disjoint data by fixed seed offset.
+        data_seed = seed + 1000000007 if heldout else seed
+        rows = []
+        with tempfile.TemporaryDirectory(prefix='rsi-pages-') as directory:
+            for item in make_pagination_tasks(Path(directory), data_seed):
+                task = {key:item[key] for key in ('id','question','type')}
+                task['kind'] = 'datadesk'
+                try:
+                    session = self.datadesk_session(root,item['question'],item['directory'])
+                    ok = session['stop_reason']=='answer' and check_answer(item['id'],item['type'],session['answer'],item['digest'])
+                    rows.append({'task':task,'ok':ok,**session})
+                except ModelUnavailable:
+                    raise
+                except Exception as error:
+                    rows.append({'task':task,'ok':False,'error':str(error)[-1000:]})
+        return diagnose_evaluation({'score':sum(row['ok'] for row in rows)/len(rows),'traces':rows,
+                                   'size':'pagination','split':'heldout' if heldout else 'search',
+                                   'seed':seed,'data_seed':data_seed,
+                                   'scope':'CSV-only interface; heldout uses new data in the same two families'})
 
     def meta_probe(self, root, audit, label, case_index=0):
         # Exercise the generation's own policy on a separate code-repair task.

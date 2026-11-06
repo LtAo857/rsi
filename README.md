@@ -193,7 +193,8 @@ python3 -m kernel --state .rsi-datadesk resume
 - [x] DeepSeek / Codex 任务、编码、审查接口及真实单次连通性验证。
 - [x] CSV / SQL、多轮工具执行、7 类 DataDesk 任务和 compact / full 规模，已通过离线链路测试。
 - [x] 新输入对比与不参与搜索的独立修复诊断。
-- [ ] DataDesk 真实模型效果及进化实验：接口与离线链路已通过，尚未进行真实模型验证。
+- [x] DataDesk compact 真实模型链路：搜索基线 5/5、独立留出 7/7；一轮候选通过审查和初评，因降本复评不稳定被拒绝，未发布新版本。
+- [ ] DataDesk full 真实模型评测、多种子稳定性和有效升级后的策略接管。
 - [ ] 持续多轮能力增长：真实实验已有一次升级并接管下一轮，尚无持续增长证据。
 - [ ] 语义归因与完整轨迹诊断：目前为结构检查、事件规则和超时检测。
 - [ ] 精确识别无用机制：当前剪枝用净删行代理，尚无逐机制消融。
@@ -206,6 +207,7 @@ python3 -m kernel --state .rsi-datadesk resume
 - [真实模型改进实验](docs/experiments/2026-11-05-live-improvement.md)
 - [策略接管与独立修复诊断](docs/experiments/2026-11-05-policy-validation.md)
 - [CSV / SQL 多轮链路验证](docs/experiments/2026-11-05-datadesk.md)
+- [DataDesk 真实模型与进化实验](docs/experiments/2026-11-06-datadesk-live.md)
 
 ## 开发与测试
 
@@ -215,4 +217,4 @@ python3 -m unittest discover -s tests -v
 
 测试使用离线脚本和本地模拟服务验证生命周期、模型适配、工具执行、预算、回退和评分。脚本提供的修改和答案用于验证机制，不代表自主学习或真实模型效果。
 
-最近一次全量验证：2026-11-05，96 项测试全部通过。
+最近一次全量验证：2026-11-06，96 项测试全部通过；真实模型实验与离线测试分别记录。

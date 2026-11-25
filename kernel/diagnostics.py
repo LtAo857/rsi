@@ -3,12 +3,34 @@
 from collections import Counter
 from copy import deepcopy
 from decimal import Decimal, DecimalException
+import re
+
+_UNTYPED_ORDER_RE = re.compile(
+    r'\border\s+by\s+(?:"?[A-Za-z_][A-Za-z_0-9]*"?\.)?"?(qty|unit_price|unit_cost)"?(?:\s+(?:asc|desc))?(?:\s*,|\s+limit\b|\s*;|\s*$)',
+    re.IGNORECASE,
+)
+
+
+def _pagination_filter(tid, question):
+    if tid in ('p-active_sum', 'p-active_count', 'px-active_sum', 'px-active_count'):
+        return {'status': 'active'}, ('sum' if tid.endswith('_sum') else 'count')
+    if tid in ('px-region_active_sum', 'px-region_active_count'):
+        match = re.search(r'region\s+(north|south|east|west)\b', str(question))
+        if match:
+            return {'status': 'active', 'region': match.group(1)}, ('sum' if tid.endswith('_sum') else 'count')
+    if tid in ('px-priority_active_sum', 'px-priority_active_count'):
+        match = re.search(r'priority\s+(high|medium|low)\b', str(question))
+        if match:
+            return {'status': 'active', 'priority': match.group(1)}, ('sum' if tid.endswith('_sum') else 'count')
+    return None, None
 
 
 def verify_pagination_arithmetic(trace):
-    """Verify only the two fixed CSV task contracts using fully observed rows."""
-    tid = trace.get('task',{}).get('id')
-    if tid not in ('p-active_sum','p-active_count') or trace.get('ok') is not False:
+    """Verify only fixed CSV pagination task contracts using fully observed rows."""
+    task = trace.get('task', {}) if isinstance(trace.get('task'), dict) else {}
+    tid = task.get('id')
+    criteria, op = _pagination_filter(tid, task.get('question', ''))
+    if criteria is None or trace.get('ok') is not False:
         return None
     observed, end, steps = {}, None, []
     for index, entry in enumerate(trace.get('history',[])):
@@ -33,20 +55,24 @@ def verify_pagination_arithmetic(trace):
     if end is None or end>10000 or set(observed)!=set(range(end)):
         return None
     try:
-        rows = [row for row in observed.values() if row['status']=='active']
-        expected = sum((Decimal(row['qty']) for row in rows),Decimal(0)) if tid=='p-active_sum' else Decimal(len(rows))
+        rows = [row for row in observed.values() if all(row[k] == v for k, v in criteria.items())]
+        expected = sum((Decimal(row['qty']) for row in rows),Decimal(0)) if op == 'sum' else Decimal(len(rows))
         actual = Decimal(str(trace.get('answer','')).strip())
         if not expected.is_finite() or not actual.is_finite() or actual==expected:
             return None
     except (DecimalException,ValueError,KeyError,TypeError):
         return None
     return {'kind':'verified_arithmetic_mismatch','steps':steps,'certainty':'verified_for_fixed_task',
-            'detail':'All CSV rows were observed; recomputing the fixed active-record operation disagrees with the submitted number. No hidden answer was read.'}
+            'detail':'All CSV rows were observed; recomputing the fixed pagination operation disagrees with the submitted number. No hidden answer was read.'}
 
 
 def diagnose_trace(trace):
     findings = []
     pending = {}
+    saw_schema = False
+    sql_errors_before_schema = []
+    used_aggregate = False
+    read_records_steps = []
     history = trace.get('history', [])
     if (not isinstance(history, list) or any(not isinstance(row, dict) or
             not isinstance(row.get('result', {}), dict) for row in history)):
@@ -63,9 +89,17 @@ def diagnose_trace(trace):
         name, args = action['tool'], action['args']
         if 'error' in result:
             add('sql_error' if name == 'sql' else 'tool_error', [index], str(result['error'])[:500])
+            if name == 'sql' and not saw_schema:
+                sql_errors_before_schema.append(index)
             continue
+        if name == 'schema':
+            saw_schema = True
+        if name == 'aggregate':
+            used_aggregate = True
         if name in ('read_csv', 'read_file'):
             key = (name, str(args.get('path', '')))
+            if name == 'read_csv' and args.get('path') == 'records.csv':
+                read_records_steps.append(index)
             previous = pending.get(key)
             offset = args.get('offset', 0)
             gap = False if offset == 0 else (previous is None or previous[2] or offset != previous[1])
@@ -73,8 +107,16 @@ def diagnose_trace(trace):
                 pending[key] = (index, result.get('next_offset'), gap)
             else:
                 pending.pop(key, None)
-        if name == 'sql' and result.get('truncated'):
-            add('truncated_sql_result', [index], 'SQL returned only part of its rows.', 'risk')
+        if name == 'sql':
+            if result.get('truncated'):
+                add('truncated_sql_result', [index], 'SQL returned only part of its rows.', 'risk')
+            query = args.get('query', '')
+            if isinstance(query, str) and _UNTYPED_ORDER_RE.search(query):
+                add('untyped_sql_numeric_risk', [index],
+                    'SQL orders directly by a TEXT numeric column without CAST; lexicographic order may differ from numeric order.', 'risk')
+    if sql_errors_before_schema:
+        add('sql_without_schema', sql_errors_before_schema,
+            'SQL error occurred before any successful schema inspection.', 'risk')
     reason = trace.get('stop_reason')
     if reason in ('step_limit', 'context_limit', 'repeated_action'):
         add(reason, list(range(max(0, len(history)-3), len(history))), 'Runner stopped before a final answer.')
@@ -86,6 +128,11 @@ def diagnose_trace(trace):
         add('execution_error', [], str(trace['error'])[:500])
     if trace.get('ok') is False and reason == 'answer':
         add('wrong_answer', [], 'Fixed grader rejected the answer; arithmetic or SQL semantics are not inferred.')
+    tid = trace.get('task', {}).get('id') if isinstance(trace.get('task'), dict) else None
+    if (tid and (tid.startswith('p-') or tid.startswith('px-')) and trace.get('ok') is False
+            and reason == 'answer' and read_records_steps and not pending and not used_aggregate):
+        add('manual_pagination_aggregation', read_records_steps,
+            'All CSV pages were read, but the answer was submitted without calling the aggregate tool.', 'risk')
     verified = verify_pagination_arithmetic(trace)
     if verified:
         findings.append(verified)

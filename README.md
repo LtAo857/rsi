@@ -78,6 +78,7 @@ DataDesk 搜索集包含 5 类问题：客户城市查询、订单状态计数�
 | `compact`，默认 | 每类 1 题，共 5 题 | 每类 1 题，共 7 题 |
 | `full` | 每类 3 题，共 15 题 | 前 5 类各 2 题、新增 2 类各 5 题，共 20 题 |
 | `pagination`，专用环境 | 活跃记录数量、数量合计，共 2 题 | 同两类问题的新数据，共 2 题 |
+| `pagination_extended`，扩展分页环境 | 含单列及多列过滤（status / region / priority）的计数与求和，共 6 题 | 同六类问题的新数据，共 6 题 |
 
 规模随状态锁定。固定生成器按种子生成每题独立的商店数据，评分答案不传入模型提示词。配对测试使用相同种子，确认阶段使用新种子。当前覆盖 7 类合成问题，通过它们不等于具备任意数据分析能力。
 
@@ -183,6 +184,8 @@ DataDesk 一题可能产生多次模型调用。默认 2 次 trial、初评和�
 
 ```bash
 python3 -m kernel --state .rsi-datadesk status
+python3 -m kernel --state .rsi-datadesk report
+python3 -m kernel compare .rsi-state-a .rsi-state-b
 python3 -m kernel --state .rsi-datadesk heldout
 python3 -m kernel --state .rsi-datadesk validate --seeds 5
 python3 -m kernel --state .rsi-datadesk stop
@@ -202,12 +205,13 @@ python3 -m kernel diagnose .rsi-datadesk/evaluation.json > diagnosis.json
 ```
 
 诊断逐条标明轨迹下标，识别 SQL / 工具错误、无效动作、查询截断、未读或跳过的分页、
-无工具观察直接作答，以及步数、上下文或重复动作终止。诊断不修改评分：已恢复的错误保留记录，
-仍可判答对；分页和截断属于风险提示，不能直接认定为错误答案的原因。
+无工具观察直接作答、未查 `schema` 即报 SQL 错误（`sql_without_schema`）、对文本数值列未 `CAST` 直接排序（`untyped_sql_numeric_risk`）、
+分页环境读完全部页面却未调用 `aggregate` 提交错误答案（`manual_pagination_aggregation`），以及步数、上下文或重复动作终止。诊断不修改评分：已恢复的错误保留记录，
+仍可判答对；分页、截断与风险规则属于风险提示，不能直接认定为错误答案的原因。
 新的 DataDesk 评测自动保存逐题 diagnostics 和汇总，失败轨迹连同诊断进入下一轮改进证据。
 轨迹下标从 0 开始；无特定动作依据的任务级诊断使用空下标列表。
 
-两类固定分页题在全部记录已观察、记录无冲突时，可从轨迹独立重算并标记
+固定分页题（`pagination` 2 类及 `pagination_extended` 6 类）在全部记录已观察、记录无冲突时，可从轨迹独立重算并标记
 `verified_arithmetic_mismatch`；不读取评分答案，不扩展为任意 SQL 或开放任务的因果证明。
 
 `run` / `evaluate` 可显式添加 `--analysis-backend deepseek --analysis-model YOUR_ANALYSIS_MODEL`，
@@ -241,6 +245,7 @@ ablation.json；中断保留部分报告和累计用量，上一份完整报告�
 `--confirm-seeds 2`（可选 2–5，默认 0）仅在初评至少两个种子、未观察到逐题退步，且满足
 配对收益或 token 降本门槛后运行新的种子。初评与确认均通过才标记 `confirmed_task_benefit`；
 它仅表示这组任务下的证据，报告始终不授权自动删除，不能证明机制普遍无用。
+在剪枝轮中，若状态目录存在与当前活跃版本匹配且已通过确认的 `ablation.json`，内核会将其作为只读 `ablation_hints` 附入证据（仍标记 `deletion_authorized: false`，候选仍须通过完整配对与复评验收）。
 
 | 参数 | 约束 |
 |---|---|
@@ -301,12 +306,13 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 - [x] 固定分页题算术复核与可选独立模型分析接口；模型假设不参与评分。
 - [ ] 通用语义归因：固定题算术已可复核；SQL 语义与开放任务根因尚无可靠的通用验证，真实分析模型也会判断错误。
 - [x] 显式逐机制消融工具：隔离副本、配对任务、多种子、用量与退步报告，已通过离线测试。
-- [x] CSV-only 分页任务：限制单页大小、禁止 SQL 绕行、独立状态与留出数据，已通过离线测试。
+- [x] CSV-only 分页任务（`pagination` 2 题与 `pagination_extended` 6 题）：限制单页大小、禁止 SQL 绕行、独立状态与留出数据，已通过离线测试。
 - [x] 分页环境真实评测与已读数据汇总工具；完整续页后汇总，不绕过数据观察。
-- [x] 消融的新种子确认流程：初评通过后再确认，报告不直接授权删除。
+- [x] 消融的新种子确认流程与剪枝轮只读 `ablation_hints` 衔接：初评通过后再确认，报告不直接授权删除。
+- [x] 只读状态汇总（`report`）与跨状态对比（`compare`）命令，已通过离线测试。
 - [ ] 精确识别无用机制：新分页消融出现一次逐题退步，未进入确认，保留机制；普遍冗余仍无证明，自动剪枝仍使用净删行代理。
 - [x] 可选 macOS 宿主沙箱与真实拒绝测试；默认关闭，仅支持固定 DeepSeek 网络适配器。
-- [ ] 跨平台宿主沙箱与硬内存隔离：当前实现不覆盖。
+- [ ] 跨平台宿主沙箱与硬内存隔离：已新增 `--host-sandbox linux-bwrap` 命令构建、fail-closed 探针与 Linux `RLIMIT_AS` 限制（已完成离线单元测试），尚未在真实 Linux 宿主上完成端到端拒绝验证。
 
 已有真实模型实验在 advanced 套件上将任务分数从 33.3% 提高到 100%；下一轮使用新策略，因收益不足拒绝候选。五个新种子共 60 题中，40 题改善、0 题退步。结果属于固定任务范围，不能推断 DataDesk 或开放任务上的效果。
 
@@ -326,8 +332,10 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 
 ```bash
 python3 -m unittest discover -s tests -v
+# 或按测试模块并发运行（保持完整子进程边界）
+python3 tests/run_parallel.py
 ```
 
 测试使用离线脚本和本地模拟服务验证生命周期、模型适配、工具执行、预算、回退和评分。脚本提供的修改和答案用于验证机制，不代表自主学习或真实模型效果。
 
-最近一次全量验证：2026-11-06，132 项测试全部通过；真实模型实验与离线测试分别记录。
+最近一次全量验证：2026-11-25，139 项离线测试全部通过；真实模型实验与离线测试分别记录。

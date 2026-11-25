@@ -48,3 +48,30 @@ def assess_pairs(pairs):
                           [[p['baseline']['score']]*2 for p in pairs],.01,
                           candidate_costs=[p['ablated']['tokens'] for p in pairs],
                           baseline_costs=[p['baseline']['tokens'] for p in pairs])
+
+
+def confirmed_ablation_hints(report, active_version):
+    """Extract read-only pruning hints from a complete ablation of the active version."""
+    if (not isinstance(report, dict) or report.get('status') != 'complete'
+            or report.get('active') != active_version):
+        return []
+    specs = {spec['name']: spec for spec in report.get('specs', [])
+             if isinstance(spec, dict) and isinstance(spec.get('name'), str)}
+    hints = []
+    for variant in report.get('variants', []):
+        if (not isinstance(variant, dict) or not variant.get('confirmed_task_benefit')
+                or variant.get('observed_regressions', 0) != 0):
+            continue
+        spec = specs.get(variant.get('name'))
+        if not spec:
+            continue
+        hints.append({
+            'name': spec['name'],
+            'path': spec['path'],
+            'before': spec['before'],
+            'after': spec['after'],
+            'confirmed_task_benefit': True,
+            'deletion_authorized': False,
+            'note': 'Advisory task-only ablation evidence; candidate still requires full paired evaluation and confirmation.',
+        })
+    return hints

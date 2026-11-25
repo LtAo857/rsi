@@ -6,7 +6,6 @@ Only this supervisor can publish a new generation.
 """
 
 from contextlib import contextmanager
-import difflib
 import hashlib
 import json
 import math
@@ -25,36 +24,19 @@ from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace
                      review_proposal, candidate_workspace)
 from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
 from .datadesk import PaginatedToolbox, Toolbox, check_answer, run_session
-from .pagination_tasks import make_pagination_tasks
+from .pagination_tasks import make_extended_pagination_tasks, make_pagination_tasks
 from .datadesk_tasks import EVOLVE, HELDOUT_ONLY, make_split
 from .diagnostics import compact_evidence, diagnose_evaluation, task_failure_evidence
-from .ablation import apply_spec, assess_pairs, usage_delta, validate_specs
+from .ablation import apply_spec, assess_pairs, confirmed_ablation_hints, usage_delta, validate_specs
 from .isolation import clean_environment, limited_python, sandbox_command, trusted_adapter
+from .ledger import check_post_call_limits, read_usage, reserve_call, settle_call
 from .semantic import review_messages, validate_review
+from .store import (REQUIRED, archive_failure as store_archive_failure, atomic_json, diff_trees,
+                    file_lock, identity, manifest, validate_tree as store_validate_tree)
+from .reporting import write_markdown_report
 
 SOURCE = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("worker.py")
-REQUIRED = ("agent/solver.py", "evolution/policy.py")
-
-
-def atomic_json(path, data):
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    os.replace(temporary, path)
-
-
-def manifest(root):
-    result = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError("symlinks are not permitted in generations")
-        if path.is_file() and "__pycache__" not in path.parts:
-            result[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return result
-
-
-def identity(root):
-    return hashlib.sha256(json.dumps(manifest(root), sort_keys=True).encode()).hexdigest()
 
 
 class Engine:
@@ -71,12 +53,12 @@ class Engine:
         saved = json.loads(runtime_path.read_text()) if runtime_path.exists() else None
         saved_sandbox = saved.get('host_sandbox','none') if saved else 'none'
         self.host_sandbox = host_sandbox or saved_sandbox
-        if self.host_sandbox not in ('none','macos'):
+        if self.host_sandbox not in ('none', 'macos', 'linux-bwrap'):
             raise ValueError('unknown host sandbox')
         if (saved or self.state_path.exists()) and self.host_sandbox != saved_sandbox:
             raise ValueError('sandbox configuration changed; use a new state directory')
-        if self.host_sandbox == 'macos':
-            probe = subprocess.run(sandbox_command([sys.executable,'-I','-B','-c','print("ready")']),
+        if self.host_sandbox in ('macos', 'linux-bwrap'):
+            probe = subprocess.run(sandbox_command([sys.executable,'-I','-B','-c','print("ready")'], backend=self.host_sandbox),
                                    capture_output=True,text=True,timeout=10,env=clean_environment())
             if probe.returncode or probe.stdout.strip() != 'ready':
                 raise ValueError('sandbox probe failed; refusing unsandboxed execution')
@@ -89,7 +71,7 @@ class Engine:
             raise ValueError('unknown benchmark suite')
         saved_size = saved.get('datadesk_size', 'compact') if saved else 'compact'
         self.datadesk_size = datadesk_size or saved_size
-        if self.datadesk_size not in ('compact', 'full', 'pagination'):
+        if self.datadesk_size not in ('compact', 'full', 'pagination', 'pagination_extended'):
             raise ValueError('unknown DataDesk size')
         if (saved or self.state_path.exists()) and self.datadesk_size != saved_size:
             raise ValueError('DataDesk size changed; use a new state directory')
@@ -107,17 +89,8 @@ class Engine:
 
     @contextmanager
     def lock(self):
-        # flock is released by the OS even if this supervisor crashes.
-        import fcntl
-        with (self.root / "LOCK").open("a") as stream:
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError("another rsi supervisor is running") from None
-            try:
-                yield
-            finally:
-                fcntl.flock(stream, fcntl.LOCK_UN)
+        with file_lock(self.root / "LOCK"):
+            yield
 
     def event(self, **record):
         record["time"] = time.time()
@@ -142,10 +115,13 @@ class Engine:
             arguments['model_response'] = self.model_response(root, messages)
         before = identity(root)
         request = json.dumps({"root": str(root), "op": op, **arguments})
-        if self.host_sandbox == 'macos':
+        if self.host_sandbox in ('macos', 'linux-bwrap'):
             with tempfile.TemporaryDirectory(prefix='rsi-worker-') as scratch:
-                program = limited_python('import runpy; runpy.run_path('+repr(str(WORKER))+',run_name="__main__")')
-                command = sandbox_command([sys.executable,'-I','-B','-c',program],readable=[root,WORKER],writable=[scratch])
+                memory_cap = 536870912 if self.host_sandbox == 'linux-bwrap' else None
+                program = limited_python('import runpy; runpy.run_path('+repr(str(WORKER))+',run_name="__main__")',
+                                         memory_bytes=memory_cap)
+                command = sandbox_command([sys.executable,'-I','-B','-c',program],
+                                          readable=[root,WORKER],writable=[scratch],backend=self.host_sandbox)
                 process = run_bounded(command,request,root,min(self.timeout,30),1048576,env=clean_environment())
         else:
             process = subprocess.run([sys.executable,'-I','-B',str(WORKER)],input=request,
@@ -189,7 +165,7 @@ class Engine:
     def datadesk_session(self, root, question, data_dir):
         if not isinstance(question, str) or not question.strip() or len(question) > 10000:
             raise ValueError('invalid DataDesk question')
-        tools = (PaginatedToolbox if self.datadesk_size == 'pagination' else Toolbox)(data_dir)
+        tools = (PaginatedToolbox if self.datadesk_size in ('pagination', 'pagination_extended') else Toolbox)(data_dir)
         def choose(context):
             messages = self.call(root, 'messages', task=context)
             text = self.model_response(root, messages)
@@ -294,108 +270,23 @@ class Engine:
         return state
 
     def validate_tree(self, candidate):
-        files = manifest(candidate)
-        for relative in files:
-            parts = Path(relative).parts
-            if parts[0] not in ("agent", "evolution") or not relative.endswith((".py", ".md", ".json")):
-                raise ValueError("outside mutable scope: " + relative)
-            if (candidate / relative).stat().st_size > 200_000:
-                raise ValueError("source file too large")
-            if relative.endswith('.py'):
-                try:
-                    compile((candidate / relative).read_bytes(), relative, 'exec')
-                except (SyntaxError, ValueError) as error:
-                    raise ValueError('invalid Python source: ' + relative) from error
-        if not all(relative in files for relative in REQUIRED):
-            raise ValueError("required interfaces were removed")
+        store_validate_tree(candidate, REQUIRED)
 
     def archive_failure(self, candidate, current, audit):
-        """Preserve bounded, untrusted source even when normal validation never ran.
-
-        Never follow symlinks or copy Git control files. Incomplete archives are
-        explicit: an invalid candidate must not prevent publishing its diagnosis.
-        """
-        destination = audit / 'rejected-source'
-        destination.mkdir(exist_ok=True)
-        saved, skipped, errors, patch = [], [], [], []
-        remaining = 2_000_000
-        paths = set()
-        for folder in ('agent', 'evolution'):
-            for root in (candidate, current):
-                base = root / folder
-                if base.is_dir() and not base.is_symlink():
-                    paths.update(p.relative_to(root) for p in base.rglob('*') if not p.is_dir())
-        paths.add(Path('.rsi-proposal.json'))
-        for relative in sorted(paths):
-            versions = []
-            for root in (current, candidate):
-                source = root / relative
-                try:
-                    if any((root / Path(*relative.parts[:i])).is_symlink()
-                           for i in range(1, len(relative.parts) + 1)):
-                        if root == candidate:
-                            skipped.append({'path': str(relative), 'reason': 'symlink'})
-                        versions.append(None)
-                        continue
-                    if not source.is_file():
-                        versions.append(b'')
-                        continue
-                    with source.open('rb') as stream:
-                        data = stream.read(200_001)
-                    if len(data) > 200_000 or len(data) > remaining:
-                        if root == candidate:
-                            skipped.append({'path': str(relative), 'reason': 'size limit'})
-                        versions.append(None)
-                        continue
-                    if root == candidate:
-                        target = destination / relative
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(data)
-                        remaining -= len(data)
-                        saved.append(str(relative))
-                    versions.append(data)
-                except OSError as error:
-                    errors.append({'path': str(relative), 'reason': str(error)})
-                    versions.append(None)
-            if all(value is not None for value in versions):
-                patch.extend(difflib.unified_diff(
-                    versions[0].decode(errors='replace').splitlines(True),
-                    versions[1].decode(errors='replace').splitlines(True),
-                    fromfile='before/' + str(relative), tofile='after/' + str(relative)))
-        (audit / 'rejected-changes.patch').write_text(''.join(patch))
-        metadata = {'saved': saved, 'skipped': skipped, 'errors': errors,
-                    'complete': not skipped and not errors,
-                    'scope': 'agent/, evolution/, proposal; excludes symlinks and Git metadata'}
-        atomic_json(audit / 'rejected-archive.json', metadata)
-        return metadata
+        return store_archive_failure(candidate, current, audit)
 
     def code(self, workspace, prompt, log, command=None):
         command = command or self.command
         if not command:
             raise RuntimeError("a coding command is required; use --coder or --demo")
-        if self.host_sandbox == 'macos':
+        if self.host_sandbox in ('macos', 'linux-bwrap'):
             trusted_adapter(command,SOURCE)
             # Network-enabled adapters must not import candidate/user PYTHONPATH.
             command = [command[0],'-I',*command[1:]]
         if self.search.max_prompt_chars is not None and len(prompt) > self.search.max_prompt_chars:
             raise RuntimeError('call prompt character limit exceeded before launch')
         usage_path = self.root / "usage.json"
-        usage = (json.loads(usage_path.read_text()) if usage_path.exists() else
-                 {"calls": 0, "tokens": 0, "cost_usd": 0.0,
-                  "unknown_tokens": 0, "unknown_cost": 0})
-        for limit, key in ((self.search.max_calls, "calls"),
-                           (self.search.max_tokens, "tokens"),
-                           (self.search.max_cost, "cost_usd")):
-            if limit is not None and usage[key] >= limit:
-                raise RuntimeError("budget exhausted: " + key)
-        if ((self.search.max_tokens is not None and usage["unknown_tokens"]) or
-                (self.search.max_cost is not None and usage["unknown_cost"])):
-            raise RuntimeError("usage unknown; cannot enforce configured budget")
-        # Reserve before launching: a crash or timeout cannot erase a paid invocation.
-        usage["calls"] += 1
-        usage["unknown_tokens"] += 1
-        usage["unknown_cost"] += 1
-        atomic_json(usage_path, usage)
+        usage = reserve_call(usage_path, self.search)
         interrupted = None
         try:
             process = run_bounded(command, prompt, workspace, self.timeout,
@@ -415,24 +306,12 @@ class Engine:
         if process.returncode:
             trace["failures"].append("command_error")
         atomic_json(log.with_suffix(".trace.json"), trace)
-        for key, missing in (("tokens", "unknown_tokens"), ("cost_usd", "unknown_cost")):
-            if trace[key] is not None:
-                usage[key] += trace[key]
-                usage[missing] -= 1
-        atomic_json(usage_path, usage)
+        settle_call(usage_path, usage, trace)
         if interrupted:
             raise interrupted
         if process.returncode:
             raise RuntimeError(f"coding command failed ({process.returncode}); see {log}")
-        for limit, key in ((self.search.max_tokens, "tokens"), (self.search.max_cost, "cost_usd")):
-            if limit is not None and trace[key] is None:
-                raise RuntimeError("usage missing for configured budget: " + key)
-            if limit is not None and usage[key] > limit:
-                raise RuntimeError("budget exceeded: " + key)
-        if self.search.max_call_tokens is not None and trace['tokens'] is not None and trace['tokens'] > self.search.max_call_tokens:
-            raise RuntimeError('reported call token limit exceeded')
-        if self.search.max_call_tokens is not None and trace['tokens'] is None:
-            raise RuntimeError('usage missing for configured call token limit')
+        check_post_call_limits(usage, trace, self.search)
         if set(trace["failures"]) & {"give_up", "loop", "repeated_tool_call", "tool_error"}:
             raise TraceFailure("trace failure: " + ", ".join(trace["failures"]))
         return process.stdout
@@ -472,10 +351,8 @@ class Engine:
                            self.search.semantic_reviewer, seed + i, self.command,
                            self.task_command, self.timeout, sys.version,
                            sorted(os.environ.items()),
-                           [(name, hashlib.sha256((SOURCE / 'kernel' / name).read_bytes()).hexdigest())
-                            for name in ('engine.py', 'evaluation.py', 'worker.py', 'backends.py', 'search.py',
-                                         'datadesk.py', 'datadesk_tasks.py', 'diagnostics.py', 'pagination_tasks.py',
-                                         'semantic.py','isolation.py','execution.py')]]
+                           [(path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+                            for path in sorted((SOURCE / 'kernel').glob('*.py'))]]
                 key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
                 cache = self.root / 'baseline-cache' / (key + '.json')
                 if cache.exists():
@@ -539,7 +416,7 @@ class Engine:
     def score_datadesk(self, root, seed, heldout=False):
         if not self.task_command:
             raise ModelUnavailable('DataDesk requires a task model backend')
-        if self.datadesk_size == 'pagination':
+        if self.datadesk_size in ('pagination', 'pagination_extended'):
             return self.score_pagination(root, seed, heldout)
         with tempfile.TemporaryDirectory(prefix='rsi-datadesk-') as directory:
             directory = Path(directory)
@@ -572,8 +449,10 @@ class Engine:
         # Same task families in both splits, disjoint data by fixed seed offset.
         data_seed = seed + 1000000007 if heldout else seed
         rows = []
+        maker = (make_extended_pagination_tasks if self.datadesk_size == 'pagination_extended'
+                 else make_pagination_tasks)
         with tempfile.TemporaryDirectory(prefix='rsi-pages-') as directory:
-            for item in make_pagination_tasks(Path(directory), data_seed):
+            for item in maker(Path(directory), data_seed):
                 task = {key:item[key] for key in ('id','question','type')}
                 task['kind'] = 'datadesk'
                 try:
@@ -585,9 +464,9 @@ class Engine:
                 except Exception as error:
                     rows.append({'task':task,'ok':False,'error':str(error)[-1000:]})
         return self.semantic_review(root,diagnose_evaluation({'score':sum(row['ok'] for row in rows)/len(rows),'traces':rows,
-                                   'size':'pagination','split':'heldout' if heldout else 'search',
+                                   'size':self.datadesk_size,'split':'heldout' if heldout else 'search',
                                    'seed':seed,'data_seed':data_seed,
-                                   'scope':'CSV-only interface; heldout uses new data in the same two families'}))
+                                   'scope':'CSV-only interface; heldout uses new data in the same task families'}))
 
     def semantic_review(self, root, evaluation):
         if self.search.semantic_reviewer:
@@ -630,9 +509,11 @@ class Engine:
             # Fresh supervisor-only test values, including negatives and floats.
             program = ('import json\n' + case['imports'] + '\n' + case.get('setup', '') +
                        '\nprint(json.dumps(' + case['expression'] + '))')
-            if self.host_sandbox == 'macos':
+            if self.host_sandbox in ('macos', 'linux-bwrap'):
+                memory_cap = 536870912 if self.host_sandbox == 'linux-bwrap' else None
                 command = sandbox_command([sys.executable,'-I','-B','-c',limited_python(
-                    'import sys; sys.path.insert(0,'+repr(str(workspace))+');\n'+program)],readable=[workspace])
+                    'import sys; sys.path.insert(0,'+repr(str(workspace))+');\n'+program,
+                    memory_bytes=memory_cap)],readable=[workspace],backend=self.host_sandbox)
                 result = run_bounded(command,'',workspace,30,1048576,env=clean_environment())
             else:
                 result = subprocess.run([sys.executable,'-B','-c',program],cwd=workspace,
@@ -679,6 +560,14 @@ class Engine:
         failures.append({"id": "complexity", "kind": "maintenance",
                          "description": "Remove redundant mechanisms without losing capability"})
         evidence["failures"] = failures
+        if evidence["search"]["prune"] and (self.root / "ablation.json").exists():
+            try:
+                ablation_report = json.loads((self.root / "ablation.json").read_text())
+            except (OSError, ValueError):
+                ablation_report = None
+            hints = confirmed_ablation_hints(ablation_report, state["active"])
+            if hints:
+                evidence["ablation_hints"] = hints
         strategy = self.analyze(current, evidence)
         if strategy is not None:
             evidence['strategy'] = strategy
@@ -694,7 +583,7 @@ class Engine:
                 goal += " Preserve parse_action(text). DataDesk runs up to 10 actions: JSON {tool,args} or {answer}. build_messages receives question, tool descriptions and full action/result history. Tools and scoring are fixed."
                 from .datadesk import TOOL_HELP
                 goal += ' Available tool contracts for this profile: '+json.dumps(
-                    PaginatedToolbox.help if self.datadesk_size=='pagination' else TOOL_HELP)
+                    PaginatedToolbox.help if self.datadesk_size in ('pagination', 'pagination_extended') else TOOL_HELP)
             else:
                 goal += " The task runtime supports one stateless model call per task."
         prompt = self.call(current, "plan", evidence=evidence, goal=goal)
@@ -743,14 +632,8 @@ class Engine:
                 self.validate_tree(candidate)
                 shutil.copytree(candidate, audit / "candidate",
                                 ignore=shutil.ignore_patterns("__pycache__"))
-                patch = []
-                for relative in sorted(set(manifest(current)) | set(manifest(candidate))):
-                    before_file, after_file = current / relative, candidate / relative
-                    before_text = before_file.read_text().splitlines(True) if before_file.exists() else []
-                    after_text = after_file.read_text().splitlines(True) if after_file.exists() else []
-                    patch.extend(difflib.unified_diff(before_text, after_text,
-                                 fromfile="before/" + relative, tofile="after/" + relative))
-                (audit / "changes.patch").write_text("".join(patch))
+                patch_text = diff_trees(current, candidate)
+                (audit / "changes.patch").write_text(patch_text)
                 stats = patch_stats(current, candidate)
                 record["changed"] = stats["files"]
                 review = review_proposal(proposal, stats, evidence)
@@ -766,7 +649,7 @@ class Engine:
                         fingerprint = identity(review_root)
                         review_prompt = json.dumps({"instruction": "Review evidence and patch. Return one JSON line with approved (boolean) and reason. Do not modify files.",
                                                     "evidence": evidence, "proposal": proposal,
-                                                    "patch": "".join(patch)})
+                                                    "patch": patch_text})
                         output = self.code(review_root, review_prompt, audit / "reviewer.log",
                                            command=self.search.reviewer)
                         if identity(review_root) != fingerprint:
@@ -829,19 +712,7 @@ class Engine:
         return record
 
     def report(self):
-        state = self.state()
-        lines = ["# RSI 运行报告", "", f"当前版本：`{state['active']}`",
-                 f"已完成轮数：{state['round']}", "",
-                 "| 轮次 | 使用的策略版本 | 基线（任务/修复） | 候选 | 接受 |",
-                 "|---|---|---|---|---|"]
-        for record in self.recent_history():
-            if record.get("type") == "round":
-                lines.append(f"| {record['round']} | {record['planner_version'][:12]} | "
-                             f"{record['baseline']} | {record.get('candidate', '未通过')} | "
-                             f"{record['accepted']} |")
-        lines += ["", "完整历史见 history.jsonl；每轮的证据、源码、diff 与日志见 rounds/。",
-                  "离线 demo 使用预设补丁，分数仅验证生命周期，不证明模型自主改进能力。"]
-        (self.root / "REPORT.md").write_text("\n".join(lines) + "\n")
+        write_markdown_report(self.root, self.state(), self.recent_history())
 
     def recent_history(self, limit=8):
         path = self.root / "history.jsonl"

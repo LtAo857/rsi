@@ -16,6 +16,10 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
     diagnose = sub.add_parser('diagnose', help='离线诊断已有任务报告，不调用模型、不写搜索历史')
     diagnose.add_argument('report', help='evaluation.json 或 trial tasks.json')
+    sub.add_parser('report', help='只读汇总状态目录的轮次、诊断与用量，不修改状态')
+    compare = sub.add_parser('compare', help='只读比较两个状态目录的评测、轮次与用量')
+    compare.add_argument('left', help='基准状态目录')
+    compare.add_argument('right', help='对比状态目录')
     ablate = sub.add_parser('ablate', help='在独立副本中逐机制消融，仅生成诊断报告')
     ablate.add_argument('specs', help='name/path/before/after 对象组成的 JSON 数组')
     ablate.add_argument('--seeds', type=int, default=2)
@@ -37,7 +41,7 @@ def main():
     run.add_argument('--trials', type=int, default=2, help='每阶段配对评测次数')
     run.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'],
                      help='评测套件；datadesk 使用 CSV/SQL 多轮任务模型，选择后锁定')
-    run.add_argument('--datadesk-size', choices=['compact', 'full', 'pagination'], help='compact/full 数据分析；pagination 为 CSV-only 多页读取，选择后锁定')
+    run.add_argument('--datadesk-size', choices=['compact', 'full', 'pagination', 'pagination_extended'], help='compact/full 数据分析；pagination / pagination_extended 为 CSV-only 多页读取，选择后锁定')
     run.add_argument('--noise-floor', type=float, default=.01, help='最小有效分数提升')
     run.add_argument('--regression-tolerance', type=float, default=0.0, help='可选配对置信下界容忍，默认逐 trial 不退步')
     run.add_argument('--cost-band', type=float, default=.05, help='接受等能力降本版本所需的最小 token 节省比例')
@@ -67,7 +71,7 @@ def main():
     solve.add_argument('--max-cost', type=float)
     evaluate = sub.add_parser('evaluate', help='运行当前版本的任务评测，不参与搜索')
     evaluate.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'])
-    evaluate.add_argument('--datadesk-size', choices=['compact', 'full', 'pagination'])
+    evaluate.add_argument('--datadesk-size', choices=['compact', 'full', 'pagination', 'pagination_extended'])
     evaluate.add_argument('--split', choices=['search', 'heldout'], default='search')
     evaluate.add_argument('--seed', type=int, default=982451653)
     evaluate.add_argument('--timeout', type=int, default=120)
@@ -106,7 +110,7 @@ def main():
     sub.add_parser("stop", help="当前轮完成后停止")
     sub.add_parser("resume", help="清除停止标记")
     for command_parser in (run,solve,evaluate,policy,ablate,initialize):
-        command_parser.add_argument('--host-sandbox', choices=['none','macos'], help='macOS 候选 Python 隔离，配置随状态锁定；仅允许固定 DeepSeek 网络适配器')
+        command_parser.add_argument('--host-sandbox', choices=['none','macos','linux-bwrap'], help='候选 Python 宿主隔离（macos / linux-bwrap），配置随状态锁定；仅允许固定 DeepSeek 网络适配器')
     args = parser.parse_args()
     if args.action == 'diagnose':
         from .diagnostics import diagnose_evaluation
@@ -114,6 +118,22 @@ def main():
             report = json.loads(Path(args.report).read_text())
             result = diagnose_evaluation(report.get('evaluation', report))
         except (OSError, ValueError, AttributeError) as error:
+            parser.error(str(error))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.action == 'report':
+        from .reporting import summarize_state
+        try:
+            result = summarize_state(args.state)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.action == 'compare':
+        from .reporting import compare_states
+        try:
+            result = compare_states(args.left, args.right)
+        except (OSError, ValueError) as error:
             parser.error(str(error))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

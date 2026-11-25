@@ -39,6 +39,7 @@ def main():
     run.add_argument("--coder-model", default="", help="编码模型名，Codex 留空使用本机配置")
     mode.add_argument("--demo", action="store_true", help="确定性离线演示，不调用模型")
     run.add_argument('--trials', type=int, default=2, help='每阶段配对评测次数')
+    run.add_argument('--candidates', type=int, default=1, help='单轮复用基线最多尝试的候选数（1–5，默认 1）')
     run.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'],
                      help='评测套件；datadesk 使用 CSV/SQL 多轮任务模型，选择后锁定')
     run.add_argument('--datadesk-size', choices=['compact', 'full', 'pagination', 'pagination_extended'], help='compact/full 数据分析；pagination / pagination_extended 为 CSV-only 多页读取，选择后锁定')
@@ -86,10 +87,14 @@ def main():
         command_parser.add_argument('--api-key-env', help='存放 API 密钥的环境变量名')
         command_parser.add_argument('--task-output-tokens', type=int, help='DeepSeek 每个任务动作的服务端输出 token 上限')
         command_parser.add_argument('--task-thinking', choices=['enabled', 'disabled'], help='DeepSeek 任务模型思考模式')
+        command_parser.add_argument('--http-retries', type=int, default=0, help='DeepSeek 瞬态 HTTP 错误重试次数（0–3，默认 0）')
     for command_parser in (run,evaluate):
         command_parser.add_argument('--analysis-backend', choices=['deepseek','codex'], help='可选独立失败分析模型；假设不作为评分真值')
         command_parser.add_argument('--analysis-model', default='')
     sub.add_parser("status", help="查看版本与改进历史")
+    sub.add_parser("versions", help="列出已发布版本及其完整性校验状态")
+    rollback = sub.add_parser("rollback", help="手动回退到指定已发布版本（需通过哈希与健康检查）")
+    rollback.add_argument("version", help="目标版本的 64 位 SHA256 ID")
     sub.add_parser("heldout", help="最终留出集验证，不参与版本选择")
     validate = sub.add_parser('validate', help='在多个新种子上比较初始与当前版本，不参与搜索')
     validate.add_argument('--seeds', type=int, default=3)
@@ -151,19 +156,21 @@ def main():
             command = backend_command(args.coder_backend, 'coder', args.coder_model,
                                       args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated,
                                       max_output_tokens=args.provider_output_tokens,
-                                      thinking=args.deepseek_thinking)
+                                      thinking=args.deepseek_thinking,
+                                      retries=getattr(args, 'http_retries', 0) if args.coder_backend == 'deepseek' else 0)
         else:
             command = shlex.split(args.coder)
     settings = {}
     if args.action == 'run':
         settings = {name: getattr(args, name) for name in (
-            'trials', 'noise_floor', 'edit_budget', 'min_edit_budget', 'decay',
+            'trials', 'candidates', 'noise_floor', 'edit_budget', 'min_edit_budget', 'decay',
             'stagnation', 'prune_every', 'max_calls', 'max_tokens', 'max_cost', 'worktrees', 'cache_baseline',
             'regression_tolerance', 'cost_band', 'max_call_tokens', 'max_prompt_chars', 'max_output_bytes')}
         settings['reviewer'] = (backend_command(args.reviewer_backend, 'reviewer', args.reviewer_model,
                                                 args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated,
                                                 max_output_tokens=args.provider_output_tokens if args.reviewer_backend == 'deepseek' else None,
-                                                thinking=args.deepseek_thinking if args.reviewer_backend == 'deepseek' else None)
+                                                thinking=args.deepseek_thinking if args.reviewer_backend == 'deepseek' else None,
+                                                retries=getattr(args, 'http_retries', 0) if args.reviewer_backend == 'deepseek' else 0)
                                 if args.reviewer_backend else
                                 shlex.split(args.reviewer) if args.reviewer else None)
     if args.action == 'solve':
@@ -180,7 +187,8 @@ def main():
     if getattr(args, 'task_backend', None):
         task_command = backend_command(args.task_backend, 'task', args.task_model,
                                        args.base_url, args.api_key_env, getattr(args, 'timeout', 300), codex_isolated=args.codex_isolated,
-                                       max_output_tokens=args.task_output_tokens, thinking=args.task_thinking)
+                                       max_output_tokens=args.task_output_tokens, thinking=args.task_thinking,
+                                       retries=getattr(args, 'http_retries', 0) if args.task_backend == 'deepseek' else 0)
     try:
         engine = Engine(args.state, command, getattr(args, "timeout", 300), task_command=task_command,
                         benchmark=getattr(args, 'benchmark', None),
@@ -226,6 +234,13 @@ def main():
                 engine.version(state["active"]), seed=982451653, heldout=True)}
             from .engine import atomic_json
             atomic_json(engine.root / "heldout.json", result)
+        elif args.action == "versions":
+            result = engine.list_versions()
+        elif args.action == "rollback":
+            try:
+                result = engine.rollback(args.version)
+            except ValueError as error:
+                parser.error(str(error))
         else:
             result = {**state, "history": engine.recent_history()}
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -184,6 +184,8 @@ DataDesk 一题可能产生多次模型调用。默认 2 次 trial、初评和�
 
 ```bash
 python3 -m kernel --state .rsi-datadesk status
+python3 -m kernel --state .rsi-datadesk versions
+python3 -m kernel --state .rsi-datadesk rollback <64-hex-version-id>
 python3 -m kernel --state .rsi-datadesk report
 python3 -m kernel compare .rsi-state-a .rsi-state-b
 python3 -m kernel --state .rsi-datadesk heldout
@@ -293,9 +295,9 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 
 - [x] 执行代码与进化策略共同版本化，新策略接管下一轮。
 - [x] 候选隔离、范围和策略接口检查、固定评分、可选独立模型审查。
-- [x] 配对评测、新输入确认、源码快照、回退和失败归档。
-- [x] 编辑预算、停滞探索、基础剪枝、token 成本选择与运行限制。
-- [x] DeepSeek / Codex 任务、编码、审查接口及真实单次连通性验证。
+- [x] 配对评测、新输入确认、源码快照、自动/手动回退（`versions` / `rollback`）和失败归档。
+- [x] 编辑预算、停滞探索、基础剪枝、token 成本选择、单轮多候选复用基线（`--candidates`）与运行限制。
+- [x] DeepSeek / Codex 任务、编码、审查接口、可选瞬态 HTTP 重试（`--http-retries`）及真实单次连通性验证。
 - [x] CSV / SQL、多轮工具执行、7 类 DataDesk 任务和 compact / full 规模，已通过离线链路测试。
 - [x] 新输入对比与不参与搜索的独立修复诊断。
 - [x] DataDesk compact 真实模型链路：搜索基线 5/5、独立留出 7/7；一轮候选通过审查和初评，因降本复评不稳定被拒绝，未发布新版本。
@@ -338,4 +340,4 @@ python3 tests/run_parallel.py
 
 测试使用离线脚本和本地模拟服务验证生命周期、模型适配、工具执行、预算、回退和评分。脚本提供的修改和答案用于验证机制，不代表自主学习或真实模型效果。
 
-最近一次全量验证：2026-11-25，139 项离线测试全部通过；真实模型实验与离线测试分别记录。
+最近一次全量验证：2026-11-25，142 项离线测试全部通过；真实模型实验与离线测试分别记录。

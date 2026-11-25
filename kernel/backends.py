@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -32,12 +33,18 @@ def json_value(text):
     return json.loads(text)
 
 
-def deepseek_completion(prompt, model, base_url, api_key_env, timeout=300, max_output_tokens=None, thinking=None):
+_RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504})
+
+
+def deepseek_completion(prompt, model, base_url, api_key_env, timeout=300, max_output_tokens=None,
+                        thinking=None, retries=0, retry_delay=1.0):
     key = os.environ.get(api_key_env)
     if not key:
         raise ModelUnavailable('missing API key environment variable: ' + api_key_env)
     if not model:
         raise ModelUnavailable('DeepSeek requires an explicit model or RSI_MODEL_NAME / DATADESK_MODEL_NAME')
+    if type(retries) is not int or not 0 <= retries <= 3:
+        raise ValueError('retries must be an integer in [0, 3]')
     payload = {'model':model, 'messages':[
         {'role':'system', 'content':'Follow the supplied protocol. Return only the requested output.'},
         {'role':'user', 'content':prompt}], 'stream':False}
@@ -53,14 +60,23 @@ def deepseek_completion(prompt, model, base_url, api_key_env, timeout=300, max_o
     request = urllib.request.Request(base_url.rstrip('/') + '/chat/completions', data=body,
                                      headers={'Content-Type':'application/json',
                                               'Authorization':'Bearer ' + key})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        # Never echo response bodies or request headers: either can contain secrets.
-        raise ModelUnavailable(f'DeepSeek HTTP {error.code}') from None
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        raise ModelUnavailable('DeepSeek transport or response failure') from None
+    data = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read())
+            break
+        except urllib.error.HTTPError as error:
+            if error.code in _RETRYABLE_HTTP and attempt < retries:
+                time.sleep(retry_delay * (2 ** attempt))
+                continue
+            # Never echo response bodies or request headers: either can contain secrets.
+            raise ModelUnavailable(f'DeepSeek HTTP {error.code}') from None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            if attempt < retries:
+                time.sleep(retry_delay * (2 ** attempt))
+                continue
+            raise ModelUnavailable('DeepSeek transport or response failure') from None
     try:
         native = data.get('usage') or {}
         usage = {'type':'usage', 'input_tokens':native.get('prompt_tokens'),
@@ -183,7 +199,7 @@ def apply_patch_response(root, response):
 
 
 def backend_command(backend, role, model='', base_url=None, api_key_env=None, timeout=300, codex_isolated=False,
-                    max_output_tokens=None, thinking=None):
+                    max_output_tokens=None, thinking=None, retries=0):
     model = model or os.environ.get('RSI_MODEL_NAME', os.environ.get('DATADESK_MODEL_NAME', ''))
     base_url = base_url or os.environ.get('RSI_BASE_URL', os.environ.get('DATADESK_BASE_URL', 'https://api.deepseek.com/v1'))
     api_key_env = api_key_env or os.environ.get('RSI_API_KEY_ENV', os.environ.get('DATADESK_API_KEY_ENV', 'DEEPSEEK_API_KEY'))
@@ -205,6 +221,12 @@ def backend_command(backend, role, model='', base_url=None, api_key_env=None, ti
         if backend != 'deepseek':
             raise ValueError('thinking mode is currently supported only for DeepSeek')
         command += ['--thinking', thinking]
+    if retries:
+        if backend != 'deepseek':
+            raise ValueError('HTTP retries are currently supported only for DeepSeek')
+        if type(retries) is not int or not 1 <= retries <= 3:
+            raise ValueError('retries must be an integer in [0, 3]')
+        command += ['--retries', str(retries)]
     return command
 
 
@@ -219,6 +241,7 @@ def main():
     parser.add_argument('--isolated', action='store_true', help='Codex: ignore user config while preserving login')
     parser.add_argument('--max-output-tokens', type=int)
     parser.add_argument('--thinking', choices=['enabled', 'disabled'])
+    parser.add_argument('--retries', type=int, default=0)
     args = parser.parse_args()
     prompt = sys.stdin.read()
     events = []
@@ -240,7 +263,7 @@ def main():
                        + json.dumps(sources, ensure_ascii=False))
         if args.backend == 'deepseek':
             text, usage = deepseek_completion(prompt, args.model, args.base_url, args.api_key_env, args.timeout,
-                                             args.max_output_tokens, args.thinking)
+                                             args.max_output_tokens, args.thinking, retries=args.retries)
         else:
             text, usage = codex_completion(prompt, args.model, args.timeout,
                                            Path.cwd() if args.role == 'coder' else None, events, args.isolated)

@@ -1,15 +1,19 @@
 import contextlib
 import csv
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 from kernel.ablation import confirmed_ablation_hints
+from kernel.backends import ModelUnavailable, deepseek_completion
 from kernel.diagnostics import diagnose_trace, verify_pagination_arithmetic
 from kernel.engine import Engine, SOURCE
 from kernel.isolation import limited_python, linux_sandbox_command
@@ -17,6 +21,7 @@ from kernel.ledger import check_post_call_limits, read_usage, reserve_call, sett
 from kernel.pagination_tasks import make_extended_pagination_tasks
 from kernel.reporting import compare_states, summarize_state
 from kernel.search import SearchSettings
+from kernel.semantic import validate_review
 
 
 class ExtendedPaginationModel(Engine):
@@ -283,6 +288,109 @@ class EnhancementTests(unittest.TestCase):
             if sys.platform != 'linux':
                 with self.assertRaisesRegex(ValueError, 'Linux bwrap sandbox unavailable'):
                     Engine(root / 'state', host_sandbox='linux-bwrap')
+
+    def test_versions_list_and_manual_rollback_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / 'state'
+            demo = [sys.executable, str(SOURCE / 'examples/demo_coder.py')]
+            engine = Engine(state_dir, demo, trials=1)
+            engine.initialize()
+            initial = engine.state()['active']
+            with contextlib.redirect_stdout(io.StringIO()):
+                engine.run(1)
+            upgraded = engine.state()['active']
+            self.assertNotEqual(initial, upgraded)
+            vers_proc = subprocess.run(
+                [sys.executable, '-m', 'kernel', '--state', str(state_dir), 'versions'],
+                cwd=SOURCE, capture_output=True, text=True,
+            )
+            self.assertEqual(vers_proc.returncode, 0, vers_proc.stderr)
+            vers_data = json.loads(vers_proc.stdout)
+            self.assertEqual(len(vers_data['versions']), 2)
+            self.assertTrue(all(v['valid'] for v in vers_data['versions']))
+
+            rb_proc = subprocess.run(
+                [sys.executable, '-m', 'kernel', '--state', str(state_dir), 'rollback', initial],
+                cwd=SOURCE, capture_output=True, text=True,
+            )
+            self.assertEqual(rb_proc.returncode, 0, rb_proc.stderr)
+            rb_data = json.loads(rb_proc.stdout)
+            self.assertEqual(rb_data['active'], initial)
+            self.assertEqual(rb_data['previous'], upgraded)
+            self.assertTrue(rb_data['changed'])
+            self.assertEqual(engine.state()['active'], initial)
+
+    def test_multi_candidate_round_reuses_baseline_and_activates_second_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            counter = root / 'count.txt'
+            script = root / 'flaky_coder.py'
+            script.write_text(
+                "import json, pathlib, subprocess, sys\n"
+                f"counter = pathlib.Path({str(counter)!r})\n"
+                "prompt = sys.stdin.read()\n"
+                "if pathlib.Path('solution.py').exists():\n"
+                f"    sys.exit(subprocess.run([sys.executable, {str(SOURCE / 'examples/demo_coder.py')!r}], input=prompt, text=True).returncode)\n"
+                "n = int(counter.read_text()) if counter.exists() else 0\n"
+                "counter.write_text(str(n + 1))\n"
+                "if n == 0:\n"
+                "    # First candidate omits proposal so it fails proposal_validation.\n"
+                "    sys.exit(0)\n"
+                f"sys.exit(subprocess.run([sys.executable, {str(SOURCE / 'examples/demo_coder.py')!r}], input=prompt, text=True).returncode)\n"
+            )
+            engine = Engine(root / 'state', [sys.executable, str(script)], trials=1, candidates=2)
+            with contextlib.redirect_stdout(io.StringIO()):
+                record = engine.run(1)[0]
+            self.assertTrue(record['accepted'])
+            self.assertEqual(len(record['attempts']), 2)
+            self.assertFalse(record['attempts'][0]['accepted'])
+            self.assertTrue(record['attempts'][1]['accepted'])
+
+    def test_deepseek_retries_transient_http_and_semantic_missing_data_check(self):
+        attempts = [0]
+        class FlakyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                attempts[0] += 1
+                if attempts[0] == 1:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                body = json.dumps({
+                    'choices': [{'finish_reason': 'stop', 'message': {'content': 'ok'}}],
+                    'usage': {'prompt_tokens': 3, 'completion_tokens': 2},
+                }).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        server = HTTPServer(('127.0.0.1', 0), FlakyHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{server.server_port}'
+            os.environ['RSI_RETRY_TEST_KEY'] = 'test-secret'
+            text, usage = deepseek_completion('hi', 'test-model', url, 'RSI_RETRY_TEST_KEY', retries=1, retry_delay=0.01)
+            self.assertEqual(text, 'ok')
+            self.assertEqual(attempts[0], 2)
+            self.assertEqual(usage['input_tokens'], 3)
+        finally:
+            server.shutdown()
+            server.server_close()
+            os.environ.pop('RSI_RETRY_TEST_KEY', None)
+
+        trace = {'history': [{'action': {'tool': 'aggregate', 'args': {}}, 'result': {'value': '1'}}]}
+        bad = json.dumps({'findings': [{'kind': 'missing_data', 'steps': [0], 'hypothesis': 'missed pages'}]})
+        with self.assertRaisesRegex(ValueError, 'missing_data hypothesis'):
+            validate_review(bad, trace)
+        good_trace = {'history': [{'action': {'tool': 'read_csv', 'args': {'path': 'a.csv'}}, 'result': {'rows': []}}]}
+        good = json.dumps({'findings': [{'kind': 'missing_data', 'steps': [0, 0], 'hypothesis': 'missed pages'}]})
+        validated = validate_review(good, good_trace)
+        self.assertEqual(validated['findings'][0]['steps'], [0])
+        self.assertEqual(validated['findings'][0]['status'], 'unverified_hypothesis')
 
 
 if __name__ == '__main__':

@@ -37,12 +37,15 @@ class SearchSettings:
     max_prompt_chars: int | None = None
     max_output_bytes: int | None = None
     semantic_reviewer: list | None = None
+    candidates: int = 1
 
     def __post_init__(self):
-        for name in ('trials', 'edit_budget', 'min_edit_budget', 'stagnation', 'prune_every'):
+        for name in ('trials', 'edit_budget', 'min_edit_budget', 'stagnation', 'prune_every', 'candidates'):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(name + ' must be a positive integer')
+        if self.candidates > 5:
+            raise ValueError('candidates must be in [1, 5]')
         if self.min_edit_budget > self.edit_budget:
             raise ValueError('min_edit_budget exceeds edit_budget')
         if not math.isfinite(self.decay) or not 0 < self.decay <= 1:

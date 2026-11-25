@@ -385,16 +385,17 @@ class Engine:
                 atomic_json(cache, {'evaluation': evaluation, 'row': row, 'artifacts': artifacts})
         return rows
 
-    def accept_trials(self, candidate, baseline, audit, new_label, old_label, pruning=False):
-        def costs(label):
+    def accept_trials(self, candidate, baseline, audit, new_label, old_label, pruning=False, baseline_audit=None):
+        def costs(label, directory):
             result = []
             for i in range(len(candidate)):
-                path = audit / f'{label}-{i}.cost.json'
+                path = directory / f'{label}-{i}.cost.json'
                 result.append(json.loads(path.read_text()).get('tokens') if path.exists() else None)
             return result
         return confirmed_gain(candidate, baseline, self.search.noise_floor, pruning,
                               regression_tolerance=self.search.regression_tolerance,
-                              candidate_costs=costs(new_label), baseline_costs=costs(old_label),
+                              candidate_costs=costs(new_label, audit),
+                              baseline_costs=costs(old_label, baseline_audit or audit),
                               cost_band=self.search.cost_band)
 
     def score(self, root, seed, heldout=False):
@@ -611,105 +612,164 @@ class Engine:
                   "audit": str(audit), "search": evidence["search"],
                   "workspace": "git-worktree" if self.search.worktrees else "copy",
                   "trials": {"baseline": old_trials}}
-        with candidate_workspace(current, self.search.worktrees) as candidate:
-            try:
-                record['stage'] = 'coding'
-                git_control = (candidate / ".git").read_bytes() if self.search.worktrees else None
-                self.code(candidate, prompt, audit / "coder.log")
-                record['stage'] = 'proposal_validation'
-                if self.search.worktrees:
-                    if (candidate / ".git").read_bytes() != git_control:
-                        raise ValueError("candidate changed Git metadata")
-                    (candidate / ".git").unlink()
-                proposal_path = candidate / ".rsi-proposal.json"
-                if not proposal_path.is_file() or proposal_path.is_symlink():
-                    raise ValueError("proposal manifest .rsi-proposal.json is required")
-                if proposal_path.stat().st_size > 100_000:
-                    raise ValueError("proposal too large")
-                proposal = json.loads(proposal_path.read_text())
-                proposal_path.unlink()
-                atomic_json(audit / "proposal.json", proposal)
-                self.validate_tree(candidate)
-                shutil.copytree(candidate, audit / "candidate",
-                                ignore=shutil.ignore_patterns("__pycache__"))
-                patch_text = diff_trees(current, candidate)
-                (audit / "changes.patch").write_text(patch_text)
-                stats = patch_stats(current, candidate)
-                record["changed"] = stats["files"]
-                review = review_proposal(proposal, stats, evidence)
-                # Cheap deterministic gates precede potentially paid model review.
-                self.health(candidate)
-                self.analyze(candidate, evidence)
-                if self.search.reviewer:
-                    record['stage'] = 'review'
-                    # The reviewer receives a disposable copy; any source mutation is rejected.
-                    with tempfile.TemporaryDirectory(prefix="rsi-review-") as directory:
-                        review_root = Path(directory) / "source"
-                        shutil.copytree(candidate, review_root)
-                        fingerprint = identity(review_root)
-                        review_prompt = json.dumps({"instruction": "Review evidence and patch. Return one JSON line with approved (boolean) and reason. Do not modify files.",
-                                                    "evidence": evidence, "proposal": proposal,
-                                                    "patch": patch_text})
-                        output = self.code(review_root, review_prompt, audit / "reviewer.log",
-                                           command=self.search.reviewer)
-                        if identity(review_root) != fingerprint:
-                            raise ValueError("reviewer modified source")
-                        verdicts = []
-                        for line in output.splitlines():
-                            try:
-                                value = json.loads(line)
-                            except ValueError:
-                                continue
-                            if isinstance(value, dict) and "approved" in value:
-                                verdicts.append(value)
-                        if len(verdicts) != 1 or type(verdicts[0]["approved"]) is not bool:
-                            raise ValueError("reviewer must return one boolean verdict")
-                        review["independent"] = verdicts[0]
-                        review["approved"] = verdicts[0]["approved"]
-                atomic_json(audit / "review.json", review)
-                if not review["approved"]:
-                    raise ValueError("reviewer rejected: " + str(review["independent"].get("reason", "")))
-                candidate_id = identity(candidate)
-                if candidate_id == state["active"]:
-                    raise ValueError("no source changes")
-                before = manifest(current)
-                after = manifest(candidate)
-                record["changed"] = [p for p in sorted(set(before) | set(after))
-                                     if before.get(p) != after.get(p)]
-                record['stage'] = 'candidate_evaluation'
-                new_trials = self.trials(candidate, audit, "candidate-meta", number + 10)
-                new = json.loads((audit / 'candidate-meta-0.tasks.json').read_text())
-                record["candidate"] = [sum(r[d] for r in new_trials) / len(new_trials) for d in range(2)]
-                record["trials"]["candidate"] = new_trials
-                atomic_json(audit / "evaluation.json", new)
-                if self.accept_trials(new_trials, old_trials, audit, 'candidate-meta', 'base-meta', evidence['search']['prune']):
-                    record['stage'] = 'confirmation'
-                    base_confirm = self.trials(current, audit, "base-confirm-meta", number + 10010)
-                    confirm = self.trials(candidate, audit, "confirm-meta", number + 10010)
-                    record["trials"].update(confirmation=confirm, baseline_confirmation=base_confirm)
-                    record["confirmation"] = [sum(r[d] for r in confirm) / len(confirm) for d in range(2)]
-                    if self.accept_trials(confirm, base_confirm, audit, 'confirm-meta', 'base-confirm-meta', evidence['search']['prune']):
-                        version_id = self.publish(candidate)
-                        # Activation readiness is checked from the published generation.
-                        self.health(self.version(version_id))
-                        state.update(previous=state["active"], active=version_id)
-                        record.update(accepted=True, active=version_id, stage='activated')
-                if not record["accepted"]:
-                    record["reason"] = "no confirmed improvement without regression"
-            except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError) as error:
-                record["reason"] = str(error)
-            finally:
-                if not record['accepted']:
-                    try:
-                        record['archive'] = self.archive_failure(candidate, current, audit)
-                    except OSError as error:
-                        record['archive_error'] = str(error)
+        attempt_records = []
+        for attempt_index in range(self.search.candidates):
+            attempt_audit = audit if self.search.candidates == 1 else audit / f"attempt-{attempt_index}"
+            attempt_audit.mkdir(parents=True, exist_ok=True)
+            attempt_record = {"attempt": attempt_index, "accepted": False}
+            with candidate_workspace(current, self.search.worktrees) as candidate:
+                try:
+                    attempt_record['stage'] = 'coding'
+                    git_control = (candidate / ".git").read_bytes() if self.search.worktrees else None
+                    self.code(candidate, prompt, attempt_audit / "coder.log")
+                    attempt_record['stage'] = 'proposal_validation'
+                    if self.search.worktrees:
+                        if (candidate / ".git").read_bytes() != git_control:
+                            raise ValueError("candidate changed Git metadata")
+                        (candidate / ".git").unlink()
+                    proposal_path = candidate / ".rsi-proposal.json"
+                    if not proposal_path.is_file() or proposal_path.is_symlink():
+                        raise ValueError("proposal manifest .rsi-proposal.json is required")
+                    if proposal_path.stat().st_size > 100_000:
+                        raise ValueError("proposal too large")
+                    proposal = json.loads(proposal_path.read_text())
+                    proposal_path.unlink()
+                    atomic_json(attempt_audit / "proposal.json", proposal)
+                    self.validate_tree(candidate)
+                    shutil.copytree(candidate, attempt_audit / "candidate",
+                                    ignore=shutil.ignore_patterns("__pycache__"))
+                    patch_text = diff_trees(current, candidate)
+                    (attempt_audit / "changes.patch").write_text(patch_text)
+                    stats = patch_stats(current, candidate)
+                    attempt_record["changed"] = stats["files"]
+                    review = review_proposal(proposal, stats, evidence)
+                    # Cheap deterministic gates precede potentially paid model review.
+                    self.health(candidate)
+                    self.analyze(candidate, evidence)
+                    if self.search.reviewer:
+                        attempt_record['stage'] = 'review'
+                        # The reviewer receives a disposable copy; any source mutation is rejected.
+                        with tempfile.TemporaryDirectory(prefix="rsi-review-") as directory:
+                            review_root = Path(directory) / "source"
+                            shutil.copytree(candidate, review_root)
+                            fingerprint = identity(review_root)
+                            review_prompt = json.dumps({"instruction": "Review evidence and patch. Return one JSON line with approved (boolean) and reason. Do not modify files.",
+                                                        "evidence": evidence, "proposal": proposal,
+                                                        "patch": patch_text})
+                            output = self.code(review_root, review_prompt, attempt_audit / "reviewer.log",
+                                               command=self.search.reviewer)
+                            if identity(review_root) != fingerprint:
+                                raise ValueError("reviewer modified source")
+                            verdicts = []
+                            for line in output.splitlines():
+                                try:
+                                    value = json.loads(line)
+                                except ValueError:
+                                    continue
+                                if isinstance(value, dict) and "approved" in value:
+                                    verdicts.append(value)
+                            if len(verdicts) != 1 or type(verdicts[0]["approved"]) is not bool:
+                                raise ValueError("reviewer must return one boolean verdict")
+                            review["independent"] = verdicts[0]
+                            review["approved"] = verdicts[0]["approved"]
+                    atomic_json(attempt_audit / "review.json", review)
+                    if not review["approved"]:
+                        raise ValueError("reviewer rejected: " + str(review["independent"].get("reason", "")))
+                    candidate_id = identity(candidate)
+                    if candidate_id == state["active"]:
+                        raise ValueError("no source changes")
+                    before = manifest(current)
+                    after = manifest(candidate)
+                    attempt_record["changed"] = [p for p in sorted(set(before) | set(after))
+                                                 if before.get(p) != after.get(p)]
+                    attempt_record['stage'] = 'candidate_evaluation'
+                    new_trials = self.trials(candidate, attempt_audit, "candidate-meta", number + 10)
+                    new = json.loads((attempt_audit / 'candidate-meta-0.tasks.json').read_text())
+                    attempt_record["candidate"] = [sum(r[d] for r in new_trials) / len(new_trials) for d in range(2)]
+                    attempt_record["trials"] = {"candidate": new_trials}
+                    atomic_json(attempt_audit / "evaluation.json", new)
+                    if self.accept_trials(new_trials, old_trials, attempt_audit, 'candidate-meta', 'base-meta',
+                                          evidence['search']['prune'], baseline_audit=audit):
+                        attempt_record['stage'] = 'confirmation'
+                        base_confirm = self.trials(current, attempt_audit, "base-confirm-meta", number + 10010)
+                        confirm = self.trials(candidate, attempt_audit, "confirm-meta", number + 10010)
+                        attempt_record["trials"].update(confirmation=confirm, baseline_confirmation=base_confirm)
+                        attempt_record["confirmation"] = [sum(r[d] for r in confirm) / len(confirm) for d in range(2)]
+                        if self.accept_trials(confirm, base_confirm, attempt_audit, 'confirm-meta', 'base-confirm-meta',
+                                              evidence['search']['prune']):
+                            version_id = self.publish(candidate)
+                            # Activation readiness is checked from the published generation.
+                            self.health(self.version(version_id))
+                            state.update(previous=state["active"], active=version_id)
+                            attempt_record.update(accepted=True, active=version_id, stage='activated')
+                    if not attempt_record["accepted"]:
+                        attempt_record["reason"] = "no confirmed improvement without regression"
+                except (ValueError, RuntimeError, subprocess.TimeoutExpired, OSError) as error:
+                    attempt_record["reason"] = str(error)
+                finally:
+                    if not attempt_record['accepted']:
+                        try:
+                            attempt_record['archive'] = self.archive_failure(candidate, current, attempt_audit)
+                        except OSError as error:
+                            attempt_record['archive_error'] = str(error)
+            attempt_records.append(attempt_record)
+            if attempt_record["accepted"]:
+                break
+            if attempt_record.get("reason", "").startswith(("budget exhausted", "budget exceeded", "usage unknown")):
+                break
+        final = attempt_records[-1]
+        for key in ("accepted", "active", "stage", "reason", "changed", "candidate", "confirmation", "archive", "archive_error"):
+            if key in final:
+                record[key] = final[key]
+        if "trials" in final:
+            record["trials"].update(final["trials"])
+        if self.search.candidates > 1:
+            record["attempts"] = attempt_records
         state["round"] += 1
         atomic_json(self.state_path, state)
         atomic_json(audit / "result.json", record)
         self.event(**record)
         self.report()
         return record
+
+    def list_versions(self):
+        """Return all published versions with integrity status (read-only)."""
+        state = self.state()
+        items = []
+        for path in sorted(self.versions.iterdir()):
+            if not path.is_dir() or len(path.name) != 64 or any(c not in "0123456789abcdef" for c in path.name):
+                continue
+            try:
+                files = manifest(path)
+                valid = identity(path) == path.name
+            except (ValueError, OSError):
+                files, valid = {}, False
+            items.append({
+                "version": path.name,
+                "active": path.name == state.get("active"),
+                "previous": path.name == state.get("previous"),
+                "valid": valid,
+                "files": len(files),
+            })
+        return {"active": state.get("active"), "previous": state.get("previous"), "versions": items}
+
+    def rollback(self, version_id):
+        """Manually activate a previously published version after hash and health checks."""
+        state = self.state()
+        target = self.version(version_id)
+        if not target.is_dir():
+            raise ValueError("unknown version: " + version_id)
+        if identity(target) != version_id:
+            raise ValueError("target version hash mismatch")
+        self.health(target)
+        old_active = state["active"]
+        if old_active == version_id:
+            return {"active": version_id, "previous": state.get("previous"), "changed": False}
+        state.update(previous=old_active, active=version_id)
+        atomic_json(self.state_path, state)
+        self.event(type="manual_rollback", failed=old_active, active=version_id)
+        self.report()
+        return {"active": version_id, "previous": old_active, "changed": True}
 
     def report(self):
         write_markdown_report(self.root, self.state(), self.recent_history())

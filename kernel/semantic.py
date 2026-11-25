@@ -23,10 +23,16 @@ def validate_review(text, trace):
                 or any(type(i) is not int or not 0<=i<len(trace.get('history',[])) for i in item['steps'])
                 or not isinstance(item.get('hypothesis'),str) or not 0<len(item['hypothesis'].strip())<=2000):
             raise ValueError('semantic review must cite existing steps and a bounded hypothesis')
+        item['steps'] = sorted(set(item['steps']))
         item['status'] = 'unverified_hypothesis'
         if item['kind']=='sql_logic' and not any(
                 isinstance(trace['history'][i].get('action'),dict) and
                 trace['history'][i]['action'].get('tool')=='sql' for i in item['steps']):
             raise ValueError('SQL hypothesis must cite an actual SQL action')
+        if item['kind']=='missing_data' and not any(
+                isinstance(trace['history'][i].get('action'),dict) and
+                trace['history'][i]['action'].get('tool') in ('read_csv','read_file','sql','list_files','schema')
+                for i in item['steps']):
+            raise ValueError('missing_data hypothesis must cite a data inspection or query action')
     return {'method':'independent_model_review','findings':result['findings'],
             'scope':'step references validated; semantic truth not established; grading unchanged'}

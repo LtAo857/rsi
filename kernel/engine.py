@@ -25,7 +25,7 @@ from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace
 from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
 from .datadesk import PaginatedToolbox, Toolbox, check_answer, run_session
 from .pagination_tasks import make_extended_pagination_tasks, make_pagination_tasks
-from .datadesk_tasks import EVOLVE, HELDOUT_ONLY, make_split
+from .datadesk_tasks import EVOLVE, HARD_EXTRA, HELDOUT_ONLY, make_split
 from .diagnostics import compact_evidence, diagnose_evaluation, task_failure_evidence
 from .ablation import apply_spec, assess_pairs, confirmed_ablation_hints, usage_delta, validate_specs
 from .isolation import clean_environment, limited_python, sandbox_command, trusted_adapter
@@ -71,7 +71,7 @@ class Engine:
             raise ValueError('unknown benchmark suite')
         saved_size = saved.get('datadesk_size', 'compact') if saved else 'compact'
         self.datadesk_size = datadesk_size or saved_size
-        if self.datadesk_size not in ('compact', 'full', 'pagination', 'pagination_extended'):
+        if self.datadesk_size not in ('compact', 'full', 'hard', 'pagination', 'pagination_extended'):
             raise ValueError('unknown DataDesk size')
         if (saved or self.state_path.exists()) and self.datadesk_size != saved_size:
             raise ValueError('DataDesk size changed; use a new state directory')
@@ -423,7 +423,10 @@ class Engine:
             directory = Path(directory)
             (directory / 'tasks').mkdir()
             hashes = {}
-            families = EVOLVE + HELDOUT_ONLY if heldout else EVOLVE
+            if self.datadesk_size == 'hard':
+                families = EVOLVE + HARD_EXTRA + HELDOUT_ONLY if heldout else EVOLVE + HARD_EXTRA
+            else:
+                families = EVOLVE + HELDOUT_ONLY if heldout else EVOLVE
             plan = [(f,1) for f in families]
             if self.datadesk_size == 'full':
                 plan = ([(f,2) for f in EVOLVE] + [(f,5) for f in HELDOUT_ONLY] if heldout
@@ -617,11 +620,23 @@ class Engine:
             attempt_audit = audit if self.search.candidates == 1 else audit / f"attempt-{attempt_index}"
             attempt_audit.mkdir(parents=True, exist_ok=True)
             attempt_record = {"attempt": attempt_index, "accepted": False}
+            attempt_prompt = prompt
+            if attempt_records:
+                prior = [
+                    {k: row[k] for k in ("attempt", "stage", "reason", "changed") if k in row}
+                    for row in attempt_records
+                ]
+                note = ("\nPrevious candidate attempts in this round failed:\n"
+                        + json.dumps(prior, ensure_ascii=False)
+                        + "\nAvoid repeating those failures while keeping all supervisor requirements.")
+                if len(attempt_prompt) + len(note) <= 100_000:
+                    head, sep, tail = attempt_prompt.rpartition("\nEvidence:\n")
+                    attempt_prompt = (head + note + sep + tail) if sep else (attempt_prompt + note)
             with candidate_workspace(current, self.search.worktrees) as candidate:
                 try:
                     attempt_record['stage'] = 'coding'
                     git_control = (candidate / ".git").read_bytes() if self.search.worktrees else None
-                    self.code(candidate, prompt, attempt_audit / "coder.log")
+                    self.code(candidate, attempt_prompt, attempt_audit / "coder.log")
                     attempt_record['stage'] = 'proposal_validation'
                     if self.search.worktrees:
                         if (candidate / ".git").read_bytes() != git_control:
@@ -752,6 +767,28 @@ class Engine:
                 "files": len(files),
             })
         return {"active": state.get("active"), "previous": state.get("previous"), "versions": items}
+
+    def diff_versions(self, left_id=None, right_id=None):
+        """Return read-only unified diff and stats between two published versions."""
+        state = self.state()
+        if left_id is None:
+            initialized = next((row['active'] for row in self.recent_history(limit=None)
+                                if row.get('type') == 'initialized'), state.get('previous') or state['active'])
+            left_id = initialized
+        if right_id is None:
+            right_id = state['active']
+        left_root = self.version(left_id)
+        right_root = self.version(right_id)
+        if not left_root.is_dir():
+            raise ValueError("unknown version: " + left_id)
+        if not right_root.is_dir():
+            raise ValueError("unknown version: " + right_id)
+        return {
+            "left": left_id,
+            "right": right_id,
+            "stats": patch_stats(left_root, right_root),
+            "patch": diff_trees(left_root, right_root),
+        }
 
     def rollback(self, version_id):
         """Manually activate a previously published version after hash and health checks."""

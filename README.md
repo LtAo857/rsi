@@ -77,6 +77,7 @@ DataDesk 搜索集包含 5 类问题：客户城市查询、订单状态计数�
 |---|---|---|
 | `compact`，默认 | 每类 1 题，共 5 题 | 每类 1 题，共 7 题 |
 | `full` | 每类 3 题，共 15 题 | 前 5 类各 2 题、新增 2 类各 5 题，共 20 题 |
+| `hard` | 原 5 类 + 城市净收入 / 最高利润商品 / 复购客户数，共 8 题 | 全部 10 类各 1 题，共 10 题 |
 | `pagination`，专用环境 | 活跃记录数量、数量合计，共 2 题 | 同两类问题的新数据，共 2 题 |
 | `pagination_extended`，扩展分页环境 | 含单列及多列过滤（status / region / priority）的计数与求和，共 6 题 | 同六类问题的新数据，共 6 题 |
 
@@ -185,6 +186,7 @@ DataDesk 一题可能产生多次模型调用。默认 2 次 trial、初评和�
 ```bash
 python3 -m kernel --state .rsi-datadesk status
 python3 -m kernel --state .rsi-datadesk versions
+python3 -m kernel --state .rsi-datadesk diff
 python3 -m kernel --state .rsi-datadesk rollback <64-hex-version-id>
 python3 -m kernel --state .rsi-datadesk report
 python3 -m kernel compare .rsi-state-a .rsi-state-b
@@ -298,7 +300,7 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 - [x] 配对评测、新输入确认、源码快照、自动/手动回退（`versions` / `rollback`）和失败归档。
 - [x] 编辑预算、停滞探索、基础剪枝、token 成本选择、单轮多候选复用基线（`--candidates`）与运行限制。
 - [x] DeepSeek / Codex 任务、编码、审查接口、可选瞬态 HTTP 重试（`--http-retries`）及真实单次连通性验证。
-- [x] CSV / SQL、多轮工具执行、7 类 DataDesk 任务和 compact / full 规模，已通过离线链路测试。
+- [x] CSV / SQL、多轮工具执行、DataDesk 任务（`compact` / `full` / `hard` 规模），已通过离线链路测试。
 - [x] 新输入对比与不参与搜索的独立修复诊断。
 - [x] DataDesk compact 真实模型链路：搜索基线 5/5、独立留出 7/7；一轮候选通过审查和初评，因降本复评不稳定被拒绝，未发布新版本。
 - [x] DataDesk full 真实评测：两个搜索种子共 30/30、一个留出种子 20/20；仅代表本批固定合成任务。
@@ -311,7 +313,7 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 - [x] CSV-only 分页任务（`pagination` 2 题与 `pagination_extended` 6 题）：限制单页大小、禁止 SQL 绕行、独立状态与留出数据，已通过离线测试。
 - [x] 分页环境真实评测与已读数据汇总工具；完整续页后汇总，不绕过数据观察。
 - [x] 消融的新种子确认流程与剪枝轮只读 `ablation_hints` 衔接：初评通过后再确认，报告不直接授权删除。
-- [x] 只读状态汇总（`report`）与跨状态对比（`compare`）命令，已通过离线测试。
+- [x] 只读状态汇总（`report`）、跨状态对比（`compare`）与版本源码差异（`diff`）命令，已通过离线测试。
 - [ ] 精确识别无用机制：新分页消融出现一次逐题退步，未进入确认，保留机制；普遍冗余仍无证明，自动剪枝仍使用净删行代理。
 - [x] 可选 macOS 宿主沙箱与真实拒绝测试；默认关闭，仅支持固定 DeepSeek 网络适配器。
 - [ ] 跨平台宿主沙箱与硬内存隔离：已新增 `--host-sandbox linux-bwrap` 命令构建、fail-closed 探针与 Linux `RLIMIT_AS` 限制（已完成离线单元测试），尚未在真实 Linux 宿主上完成端到端拒绝验证。
@@ -340,4 +342,4 @@ python3 tests/run_parallel.py
 
 测试使用离线脚本和本地模拟服务验证生命周期、模型适配、工具执行、预算、回退和评分。脚本提供的修改和答案用于验证机制，不代表自主学习或真实模型效果。
 
-最近一次全量验证：2026-11-25，142 项离线测试全部通过；真实模型实验与离线测试分别记录。
+最近一次全量验证：2026-11-25，144 项离线测试全部通过；真实模型实验与离线测试分别记录。

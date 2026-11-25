@@ -42,7 +42,7 @@ def main():
     run.add_argument('--candidates', type=int, default=1, help='单轮复用基线最多尝试的候选数（1–5，默认 1）')
     run.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'],
                      help='评测套件；datadesk 使用 CSV/SQL 多轮任务模型，选择后锁定')
-    run.add_argument('--datadesk-size', choices=['compact', 'full', 'pagination', 'pagination_extended'], help='compact/full 数据分析；pagination / pagination_extended 为 CSV-only 多页读取，选择后锁定')
+    run.add_argument('--datadesk-size', choices=['compact', 'full', 'hard', 'pagination', 'pagination_extended'], help='compact/full/hard 数据分析；pagination / pagination_extended 为 CSV-only 多页读取，选择后锁定')
     run.add_argument('--noise-floor', type=float, default=.01, help='最小有效分数提升')
     run.add_argument('--regression-tolerance', type=float, default=0.0, help='可选配对置信下界容忍，默认逐 trial 不退步')
     run.add_argument('--cost-band', type=float, default=.05, help='接受等能力降本版本所需的最小 token 节省比例')
@@ -72,7 +72,7 @@ def main():
     solve.add_argument('--max-cost', type=float)
     evaluate = sub.add_parser('evaluate', help='运行当前版本的任务评测，不参与搜索')
     evaluate.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'])
-    evaluate.add_argument('--datadesk-size', choices=['compact', 'full', 'pagination', 'pagination_extended'])
+    evaluate.add_argument('--datadesk-size', choices=['compact', 'full', 'hard', 'pagination', 'pagination_extended'])
     evaluate.add_argument('--split', choices=['search', 'heldout'], default='search')
     evaluate.add_argument('--seed', type=int, default=982451653)
     evaluate.add_argument('--timeout', type=int, default=120)
@@ -93,6 +93,9 @@ def main():
         command_parser.add_argument('--analysis-model', default='')
     sub.add_parser("status", help="查看版本与改进历史")
     sub.add_parser("versions", help="列出已发布版本及其完整性校验状态")
+    diff_cmd = sub.add_parser("diff", help="只读查看两个已发布版本之间的源码差异（默认初始版本到当前版本）")
+    diff_cmd.add_argument("left", nargs="?", help="基准版本 ID（默认初始版本）")
+    diff_cmd.add_argument("right", nargs="?", help="目标版本 ID（默认当前激活版本）")
     rollback = sub.add_parser("rollback", help="手动回退到指定已发布版本（需通过哈希与健康检查）")
     rollback.add_argument("version", help="目标版本的 64 位 SHA256 ID")
     sub.add_parser("heldout", help="最终留出集验证，不参与版本选择")
@@ -236,6 +239,11 @@ def main():
             atomic_json(engine.root / "heldout.json", result)
         elif args.action == "versions":
             result = engine.list_versions()
+        elif args.action == "diff":
+            try:
+                result = engine.diff_versions(args.left, args.right)
+            except ValueError as error:
+                parser.error(str(error))
         elif args.action == "rollback":
             try:
                 result = engine.rollback(args.version)

@@ -42,6 +42,7 @@ STATUSES = ["completed"] * 14 + ["cancelled"] * 3 + ["refunded"] * 3
 
 EVOLVE = ["lookup", "count_status", "month_revenue", "category_cancel", "top_customer"]
 HELDOUT_ONLY = ["tier_avg_qty", "profit"]
+HARD_EXTRA = ["net_city_revenue", "top_profit_product", "repeat_customer_count"]
 
 
 def norm(kind: str, value) -> str:
@@ -126,6 +127,27 @@ def question(family: str, s: dict, rng: random.Random):
                 if cat[o["product"]] == k)
         return (f"What is the total profit, quantity x (unit price - unit cost), of completed "
                 f"orders for products in the '{k}' category? Round to 2 decimals.", "number", v)
+    if family == "net_city_revenue":
+        city_map = {c["customer_id"]: c["city"] for c in C}
+        city = rng.choice(sorted({c["city"] for c in C}))
+        v = sum(o["qty"] * o["unit_price"] for o in done if city_map[o["customer_id"]] == city)
+        return (f"What is the total revenue (quantity x unit price) of completed orders "
+                f"from customers living in {city}? Round to 2 decimals.", "number", v)
+    if family == "top_profit_product":
+        prof: dict = {}
+        for o in done:
+            prof[o["product"]] = prof.get(o["product"], 0.0) + o["qty"] * (o["unit_price"] - cost[o["product"]])
+        top = sorted(prof.items(), key=lambda kv: -kv[1])
+        if len(top) < 2 or abs(top[0][1] - top[1][1]) < 1:
+            return None
+        return ("Which product generated the highest total profit, quantity x (unit price - unit cost), "
+                "across completed orders? Give the product name.", "str", top[0][0])
+    if family == "repeat_customer_count":
+        counts: dict = {}
+        for o in done:
+            counts[o["customer_id"]] = counts.get(o["customer_id"], 0) + 1
+        repeaters = sum(1 for c in counts.values() if c >= 2)
+        return ("How many distinct customers have at least 2 completed orders?", "int", repeaters)
     raise ValueError(family)
 
 

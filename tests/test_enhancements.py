@@ -392,6 +392,88 @@ class EnhancementTests(unittest.TestCase):
         self.assertEqual(validated['findings'][0]['steps'], [0])
         self.assertEqual(validated['findings'][0]['status'], 'unverified_hypothesis')
 
+    def test_hard_datadesk_profile_generates_and_scores_new_sql_families(self):
+        from tests.fixtures.datadesk_model import query_for
+
+        def hard_query(q):
+            m = re.search(r"customers living in ([A-Za-z]+)\?", q)
+            if m:
+                return ("SELECT ROUND(SUM(CAST(o.qty AS REAL) * CAST(o.unit_price AS REAL)), 2) "
+                        "FROM orders o JOIN customers c ON o.customer_id = c.customer_id "
+                        f"WHERE o.status = 'completed' AND c.city = '{m.group(1)}'")
+            if "highest total profit" in q:
+                return ("SELECT o.product FROM orders o JOIN products p ON o.product = p.product "
+                        "WHERE o.status = 'completed' GROUP BY o.product "
+                        "ORDER BY SUM(CAST(o.qty AS REAL) * (CAST(o.unit_price AS REAL) - CAST(p.unit_cost AS REAL))) DESC LIMIT 1")
+            if "at least 2 completed orders" in q:
+                return ("SELECT COUNT(*) FROM (SELECT customer_id FROM orders "
+                        "WHERE status = 'completed' GROUP BY customer_id HAVING COUNT(*) >= 2)")
+            return query_for(q)
+
+        class HardSqlEngine(Engine):
+            def model_response(self, root, messages, command=None):
+                task = json.loads(messages['prompt'])
+                history = task['history']
+                if not history:
+                    return json.dumps({'tool': 'schema', 'args': {}})
+                if 'rows' in history[-1]['result']:
+                    return json.dumps({'answer': history[-1]['result']['rows'][0][0]})
+                return json.dumps({'tool': 'sql', 'args': {'query': hard_query(task['question'])}})
+
+        with tempfile.TemporaryDirectory() as directory:
+            engine = HardSqlEngine(directory, task_command=['offline-hard-sql'],
+                                   benchmark='datadesk', datadesk_size='hard')
+            engine.initialize()
+            root = engine.version(engine.state()['active'])
+            search_res = engine.score(root, 101)
+            heldout_res = engine.score(root, 202, heldout=True)
+            self.assertEqual(len(search_res['traces']), 8)
+            self.assertEqual(len(heldout_res['traces']), 10)
+            self.assertEqual(search_res['score'], 1.0)
+            self.assertEqual(heldout_res['score'], 1.0)
+            self.assertEqual(Engine(directory).datadesk_size, 'hard')
+            with self.assertRaises(ValueError):
+                Engine(directory, datadesk_size='compact')
+
+    def test_diff_cli_and_multi_candidate_failure_feedback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / 'state'
+            prompts_log = root / 'prompts.json'
+            script = root / 'feedback_coder.py'
+            script.write_text(
+                "import json, pathlib, subprocess, sys\n"
+                f"log_path = pathlib.Path({str(prompts_log)!r})\n"
+                "prompt = sys.stdin.read()\n"
+                "if pathlib.Path('solution.py').exists():\n"
+                f"    sys.exit(subprocess.run([sys.executable, {str(SOURCE / 'examples/demo_coder.py')!r}], input=prompt, text=True).returncode)\n"
+                "seen = json.loads(log_path.read_text()) if log_path.exists() else []\n"
+                "seen.append(prompt)\n"
+                "log_path.write_text(json.dumps(seen))\n"
+                "if len(seen) == 1:\n"
+                "    sys.exit(0)\n"
+                f"sys.exit(subprocess.run([sys.executable, {str(SOURCE / 'examples/demo_coder.py')!r}], input=prompt, text=True).returncode)\n"
+            )
+            engine = Engine(state_dir, [sys.executable, str(script)], trials=1, candidates=2)
+            with contextlib.redirect_stdout(io.StringIO()):
+                record = engine.run(1)[0]
+            self.assertTrue(record['accepted'])
+            seen = json.loads(prompts_log.read_text())
+            self.assertEqual(len(seen), 2)
+            self.assertNotIn('Previous candidate attempts in this round failed', seen[0])
+            self.assertIn('Previous candidate attempts in this round failed', seen[1])
+            self.assertIn('proposal_validation', seen[1])
+
+            diff_proc = subprocess.run(
+                [sys.executable, '-m', 'kernel', '--state', str(state_dir), 'diff'],
+                cwd=SOURCE, capture_output=True, text=True,
+            )
+            self.assertEqual(diff_proc.returncode, 0, diff_proc.stderr)
+            diff_data = json.loads(diff_proc.stdout)
+            self.assertNotEqual(diff_data['left'], diff_data['right'])
+            self.assertIn('agent/solver.py', diff_data['stats']['files'])
+            self.assertIn('--- before/agent/solver.py', diff_data['patch'])
+
 
 if __name__ == '__main__':
     unittest.main()

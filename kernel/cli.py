@@ -158,8 +158,8 @@ def main():
         elif args.coder_backend:
             command = backend_command(args.coder_backend, 'coder', args.coder_model,
                                       args.base_url, args.api_key_env, args.timeout, codex_isolated=args.codex_isolated,
-                                      max_output_tokens=args.provider_output_tokens,
-                                      thinking=args.deepseek_thinking,
+                                      max_output_tokens=args.provider_output_tokens if args.coder_backend == 'deepseek' else None,
+                                      thinking=args.deepseek_thinking if args.coder_backend == 'deepseek' else None,
                                       retries=getattr(args, 'http_retries', 0) if args.coder_backend == 'deepseek' else 0)
         else:
             command = shlex.split(args.coder)

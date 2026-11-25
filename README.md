@@ -304,6 +304,7 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 - [x] 新输入对比与不参与搜索的独立修复诊断。
 - [x] DataDesk compact 真实模型链路：搜索基线 5/5、独立留出 7/7；一轮候选通过审查和初评，因降本复评不稳定被拒绝，未发布新版本。
 - [x] DataDesk full 真实评测：两个搜索种子共 30/30、一个留出种子 20/20；仅代表本批固定合成任务。
+- [x] DataDesk hard 与 pagination_extended 真实基线评测（`deepseek-v4.1-flash-1017`）：`hard` 搜索 8/8 + 留出 10/10；`pagination_extended` 搜索 4/6 (66.7%) + 留出 2/6 (33.3%)，失败均被 `verified_arithmetic_mismatch` / `manual_pagination_aggregation` 捕获。
 - [ ] DataDesk 有效升级后的策略接管与更多任务/种子上的稳定性：本批三个进化候选均被拒绝，无新发布。
 - [ ] 持续多轮能力增长：真实实验已有一次升级并接管下一轮，尚无持续增长证据。
 - [x] 失败证据链路：全部 trial 失败汇总、轨迹下标、明确省略标记、完整审计与离线回放。
@@ -331,6 +332,7 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 - [提示机制真实模型消融](docs/experiments/2026-11-06-ablation-live.md)
 - [分页任务开发与测试](docs/experiments/2026-11-06-pagination.md)
 - [本批功能补齐、宿主隔离及真实评测](docs/experiments/2026-11-06-completion.md)
+- [DataDesk hard 与 pagination_extended 真实模型基线评测](docs/experiments/2026-11-25-live-eval.md)
 
 ## 开发与测试
 

@@ -18,6 +18,7 @@ from kernel.diagnostics import diagnose_trace, verify_pagination_arithmetic
 from kernel.engine import Engine, SOURCE
 from kernel.isolation import limited_python, linux_sandbox_command
 from kernel.ledger import check_post_call_limits, read_usage, reserve_call, settle_call
+from kernel.messy_tasks import make_messy_tasks
 from kernel.pagination_tasks import make_extended_pagination_tasks
 from kernel.reporting import compare_states, summarize_state
 from kernel.search import SearchSettings
@@ -494,6 +495,80 @@ class EnhancementTests(unittest.TestCase):
             self.assertNotEqual(diff_data['left'], diff_data['right'])
             self.assertIn('agent/solver.py', diff_data['stats']['files'])
             self.assertIn('--- before/agent/solver.py', diff_data['patch'])
+
+    def test_messy_datadesk_profile_requires_policy_and_cleaning(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            first = make_messy_tasks(Path(a), 777)
+            second = make_messy_tasks(Path(b), 777)
+            self.assertEqual(len(first), 6)
+            for x, y in zip(first, second):
+                self.assertEqual(x['digest'], y['digest'])
+                self.assertTrue((x['directory'] / 'policy.txt').is_file())
+                self.assertIn('TEST_', (x['directory'] / 'policy.txt').read_text())
+
+        def clean_sql(question, policy_text):
+            cte = ("WITH dedup AS ("
+                   "SELECT DISTINCT order_id, customer_id, product, "
+                   "CAST(qty AS REAL) AS qty, "
+                   "CAST(REPLACE(unit_price, '$', '') AS REAL) AS unit_price, "
+                   "LOWER(TRIM(status)) AS status "
+                   "FROM orders WHERE customer_id NOT LIKE 'TEST_%'), "
+                   "cust AS (SELECT customer_id, name, LOWER(TRIM(city)) AS city, LOWER(TRIM(tier)) AS tier "
+                   "FROM customers WHERE customer_id NOT LIKE 'TEST_%'), "
+                   "prod AS (SELECT product, LOWER(TRIM(category)) AS category, "
+                   "CAST(REPLACE(unit_cost, '$', '') AS REAL) AS unit_cost FROM products) ")
+            m = re.search(r'for customers in ([A-Za-z]+)\?', question)
+            if m:
+                return cte + (f"SELECT ROUND(SUM(d.qty * d.unit_price), 2) FROM dedup d "
+                              f"JOIN cust c ON d.customer_id = c.customer_id "
+                              f"WHERE d.status = 'completed' AND c.city = '{m.group(1).lower()}'")
+            m = re.search(r'have status "([a-z]+)"', question)
+            if m:
+                return cte + f"SELECT COUNT(*) FROM dedup WHERE status = '{m.group(1)}'"
+            m = re.search(r'in category "([a-z]+)"', question)
+            if m:
+                return cte + (f"SELECT ROUND(SUM(d.qty * (d.unit_price - p.unit_cost)), 2) FROM dedup d "
+                              f"JOIN prod p ON d.product = p.product "
+                              f"WHERE d.status = 'completed' AND p.category = '{m.group(1)}'")
+            m = re.search(r'in the "([a-z]+)" tier', question)
+            if m:
+                tier = m.group(1)
+                dm = re.search(rf'{tier}=(\d+)%', policy_text)
+                disc = int(dm.group(1))
+                return cte + (f"SELECT ROUND(SUM(d.qty * d.unit_price * {1.0 - disc / 100.0}), 2) FROM dedup d "
+                              f"JOIN cust c ON d.customer_id = c.customer_id "
+                              f"WHERE d.status = 'completed' AND c.tier = '{tier}'")
+            if 'highest total completed revenue' in question:
+                return cte + ("SELECT c.name FROM dedup d JOIN cust c ON d.customer_id = c.customer_id "
+                              "WHERE d.status = 'completed' GROUP BY d.customer_id "
+                              "ORDER BY SUM(d.qty * d.unit_price) DESC LIMIT 1")
+            return cte + ("SELECT COUNT(*) FROM (SELECT customer_id FROM dedup "
+                          "WHERE status = 'completed' GROUP BY customer_id HAVING COUNT(*) >= 2)")
+
+        class CleanMessyEngine(Engine):
+            def model_response(self, root, messages, command=None):
+                task = json.loads(messages['prompt'])
+                history = task['history']
+                if not history:
+                    return json.dumps({'tool': 'read_file', 'args': {'path': 'policy.txt'}})
+                if len(history) == 1:
+                    policy_text = history[0]['result']['text']
+                    return json.dumps({'tool': 'sql', 'args': {'query': clean_sql(task['question'], policy_text)}})
+                return json.dumps({'answer': history[-1]['result']['rows'][0][0]})
+
+        with tempfile.TemporaryDirectory() as directory:
+            engine = CleanMessyEngine(directory, task_command=['offline-messy'],
+                                      benchmark='datadesk', datadesk_size='messy')
+            engine.initialize()
+            root = engine.version(engine.state()['active'])
+            s = engine.score(root, 101)
+            h = engine.score(root, 202, heldout=True)
+            self.assertEqual(s['score'], 1.0)
+            self.assertEqual(h['score'], 1.0)
+            self.assertEqual(len(s['traces']), 6)
+            self.assertEqual(Engine(directory).datadesk_size, 'messy')
+            with self.assertRaises(ValueError):
+                Engine(directory, datadesk_size='hard')
 
 
 if __name__ == '__main__':

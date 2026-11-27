@@ -42,7 +42,7 @@ def main():
     run.add_argument('--candidates', type=int, default=1, help='单轮复用基线最多尝试的候选数（1–5，默认 1）')
     run.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'],
                      help='评测套件；datadesk 使用 CSV/SQL 多轮任务模型，选择后锁定')
-    run.add_argument('--datadesk-size', choices=['compact', 'full', 'hard', 'pagination', 'pagination_extended'], help='compact/full/hard 数据分析；pagination / pagination_extended 为 CSV-only 多页读取，选择后锁定')
+    run.add_argument('--datadesk-size', choices=['compact', 'full', 'hard', 'messy', 'pagination', 'pagination_extended'], help='compact/full/hard/messy 数据分析；pagination / pagination_extended 为 CSV-only 多页读取，选择后锁定')
     run.add_argument('--noise-floor', type=float, default=.01, help='最小有效分数提升')
     run.add_argument('--regression-tolerance', type=float, default=0.0, help='可选配对置信下界容忍，默认逐 trial 不退步')
     run.add_argument('--cost-band', type=float, default=.05, help='接受等能力降本版本所需的最小 token 节省比例')
@@ -72,7 +72,7 @@ def main():
     solve.add_argument('--max-cost', type=float)
     evaluate = sub.add_parser('evaluate', help='运行当前版本的任务评测，不参与搜索')
     evaluate.add_argument('--benchmark', choices=['basic', 'advanced', 'datadesk'])
-    evaluate.add_argument('--datadesk-size', choices=['compact', 'full', 'hard', 'pagination', 'pagination_extended'])
+    evaluate.add_argument('--datadesk-size', choices=['compact', 'full', 'hard', 'messy', 'pagination', 'pagination_extended'])
     evaluate.add_argument('--split', choices=['search', 'heldout'], default='search')
     evaluate.add_argument('--seed', type=int, default=982451653)
     evaluate.add_argument('--timeout', type=int, default=120)

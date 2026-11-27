@@ -24,6 +24,7 @@ from .search import (TraceFailure, SearchSettings, confirmed_gain, inspect_trace
                      review_proposal, candidate_workspace)
 from .evaluation import answers_equal, heldout_repair_cases, repair_case, tasks
 from .datadesk import PaginatedToolbox, Toolbox, check_answer, run_session
+from .messy_tasks import make_messy_tasks
 from .pagination_tasks import make_extended_pagination_tasks, make_pagination_tasks
 from .datadesk_tasks import EVOLVE, HARD_EXTRA, HELDOUT_ONLY, make_split
 from .diagnostics import compact_evidence, diagnose_evaluation, task_failure_evidence
@@ -71,7 +72,7 @@ class Engine:
             raise ValueError('unknown benchmark suite')
         saved_size = saved.get('datadesk_size', 'compact') if saved else 'compact'
         self.datadesk_size = datadesk_size or saved_size
-        if self.datadesk_size not in ('compact', 'full', 'hard', 'pagination', 'pagination_extended'):
+        if self.datadesk_size not in ('compact', 'full', 'hard', 'messy', 'pagination', 'pagination_extended'):
             raise ValueError('unknown DataDesk size')
         if (saved or self.state_path.exists()) and self.datadesk_size != saved_size:
             raise ValueError('DataDesk size changed; use a new state directory')
@@ -419,6 +420,8 @@ class Engine:
             raise ModelUnavailable('DataDesk requires a task model backend')
         if self.datadesk_size in ('pagination', 'pagination_extended'):
             return self.score_pagination(root, seed, heldout)
+        if self.datadesk_size == 'messy':
+            return self.score_messy(root, seed, heldout)
         with tempfile.TemporaryDirectory(prefix='rsi-datadesk-') as directory:
             directory = Path(directory)
             (directory / 'tasks').mkdir()
@@ -471,6 +474,31 @@ class Engine:
                                    'size':self.datadesk_size,'split':'heldout' if heldout else 'search',
                                    'seed':seed,'data_seed':data_seed,
                                    'scope':'CSV-only interface; heldout uses new data in the same task families'}))
+
+    def score_messy(self, root, seed, heldout=False):
+        data_seed = seed + 1000000007 if heldout else seed
+        rows = []
+        with tempfile.TemporaryDirectory(prefix='rsi-messy-') as directory:
+            for item in make_messy_tasks(Path(directory), data_seed):
+                task = {key: item[key] for key in ('id', 'question', 'type')}
+                task['kind'] = 'datadesk'
+                try:
+                    session = self.datadesk_session(root, item['question'], item['directory'])
+                    ok = session['stop_reason'] == 'answer' and check_answer(item['id'], item['type'], session['answer'], item['digest'])
+                    rows.append({'task': task, 'ok': ok, **session})
+                except ModelUnavailable:
+                    raise
+                except Exception as error:
+                    rows.append({'task': task, 'ok': False, 'error': str(error)[-1000:]})
+        return self.semantic_review(root, diagnose_evaluation({
+            'score': sum(row['ok'] for row in rows) / len(rows),
+            'traces': rows,
+            'size': 'messy',
+            'split': 'heldout' if heldout else 'search',
+            'seed': seed,
+            'data_seed': data_seed,
+            'scope': 'dirty tables plus policy.txt rules; heldout uses fresh shops and discounts',
+        }))
 
     def semantic_review(self, root, evaluation):
         if self.search.semantic_reviewer:

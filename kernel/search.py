@@ -148,7 +148,7 @@ def patch_stats(before, after):
 def review_proposal(proposal, stats, evidence):
     """Validate claims' coverage and evidence references, not their semantic truth."""
     if not isinstance(proposal, dict) or not isinstance(proposal.get('analysis'), str) or not proposal['analysis'].strip():
-        raise ValueError('proposal requires evidence analysis')
+        raise ValueError('proposal requires evidence analysis (analysis must be a nonempty string)')
     changes = proposal.get('changes')
     if not isinstance(changes, list) or not changes:
         raise ValueError('proposal requires changes linked to failure modes')

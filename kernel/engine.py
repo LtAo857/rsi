@@ -623,7 +623,7 @@ class Engine:
         if prompt.endswith(evidence_block):
             prompt = prompt[:-len(evidence_block)]
         prompt += ("\nSupervisor requirements: Read Evidence before editing. Write .rsi-proposal.json "
-                   "with analysis (evidence and cause), and changes: a list of objects containing "
+                   "with analysis (a nonempty string summarizing evidence and cause), and changes: a list of objects containing "
                    "files, failure_id, cause, expected_effect, validation. Each changed file must "
                    "reference a supplied failure ID. If Evidence.strategy exists, EVERY change.failure_id "
                    "must belong to Evidence.strategy.failure_ids, and at least one changed file must "

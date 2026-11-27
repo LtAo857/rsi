@@ -377,6 +377,27 @@ class EnhancementTests(unittest.TestCase):
             self.assertEqual(text, 'ok')
             self.assertEqual(attempts[0], 2)
             self.assertEqual(usage['input_tokens'], 3)
+            # Qwen models also receive chat_template_kwargs.enable_thinking when thinking is set.
+            captured = []
+            orig_post = FlakyHandler.do_POST
+            def capture_post(handler):
+                length = int(handler.headers.get('Content-Length', 0))
+                captured.append(json.loads(handler.rfile.read(length)))
+                body = json.dumps({
+                    'choices': [{'finish_reason': 'stop', 'message': {'content': 'ok'}}],
+                    'usage': {'prompt_tokens': 2, 'completion_tokens': 1},
+                }).encode()
+                handler.send_response(200)
+                handler.send_header('Content-Type', 'application/json')
+                handler.send_header('Content-Length', str(len(body)))
+                handler.end_headers()
+                handler.wfile.write(body)
+            FlakyHandler.do_POST = capture_post
+            try:
+                deepseek_completion('hi', 'qwen3.6-35b-a3b', url, 'RSI_RETRY_TEST_KEY', thinking='disabled')
+                self.assertEqual(captured[-1]['chat_template_kwargs'], {'enable_thinking': False})
+            finally:
+                FlakyHandler.do_POST = orig_post
         finally:
             server.shutdown()
             server.server_close()

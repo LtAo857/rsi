@@ -333,6 +333,7 @@ python3 -m kernel --state .rsi-sandbox init --host-sandbox macos
 - [分页任务开发与测试](docs/experiments/2026-11-06-pagination.md)
 - [本批功能补齐、宿主隔离及真实评测](docs/experiments/2026-11-06-completion.md)
 - [DataDesk hard 与 pagination_extended 真实模型基线评测](docs/experiments/2026-11-25-live-eval.md)
+- [Qwen3.6 真实模型基线评测（hard 与 pagination_extended）](docs/experiments/2026-11-27-qwen-live.md)
 
 ## 开发与测试
 

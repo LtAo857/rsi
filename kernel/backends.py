@@ -56,6 +56,8 @@ def deepseek_completion(prompt, model, base_url, api_key_env, timeout=300, max_o
         if thinking not in ('enabled', 'disabled'):
             raise ValueError('invalid thinking mode')
         payload['thinking'] = {'type':thinking}
+        if 'qwen' in model.lower():
+            payload['chat_template_kwargs'] = {'enable_thinking': thinking == 'enabled'}
     body = json.dumps(payload).encode()
     request = urllib.request.Request(base_url.rstrip('/') + '/chat/completions', data=body,
                                      headers={'Content-Type':'application/json',
